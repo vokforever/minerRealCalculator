@@ -1,0 +1,13 @@
+# Ignore sensitive files
+.env
+*.json
+*.log
+snapshot.json
+notes.md
+tinytuya.json
+
+# Ignore virtual environment
+.venv/
+
+# Ignore IDE files
+.idea/
