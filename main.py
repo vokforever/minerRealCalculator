@@ -2,8 +2,9 @@ import os
 import time
 import json
 import logging
+import re
 from datetime import datetime, timedelta
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Any
 from supabase import create_client, Client
 from dotenv import load_dotenv
 import tinytuya
@@ -15,6 +16,8 @@ from functools import wraps
 from threading import Lock
 from pycoingecko import CoinGeckoAPI
 import numpy as np
+from openai import OpenAI
+from cerebras.cloud.sdk import Cerebras
 
 # Настройка логирования
 logging.basicConfig(
@@ -45,6 +48,17 @@ TARIFF_SETTINGS_PATH = os.getenv("TARIFF_SETTINGS_PATH", "tariff_settings.json")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_ADMIN_ID = os.getenv("TELEGRAM_ADMIN_ID")
 
+# OpenRouter AI настройки
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+REASONING_MODEL = os.getenv("REASONING_MODEL", "deepseek/deepseek-r1-0528:free")
+OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL", "https://mining-farm.ru")
+OPENROUTER_SITE_NAME = os.getenv("OPENROUTER_SITE_NAME", "Mining Farm Analytics")
+
+# Cerebras AI настройки
+CEREBRAS_API_KEY = os.getenv("CEREBRAS_API_KEY")
+CEREBRAS_MODEL = os.getenv("CEREBRAS_MODEL", "qwen-3-235b-a22b-thinking-2507")
+
 # Проверка переменных
 required_vars = [TUYA_ACCESS_ID, TUYA_ACCESS_SECRET, SUPABASE_URL, SUPABASE_KEY, DEVICES_CONFIG_PATH]
 if not all(required_vars):
@@ -52,6 +66,10 @@ if not all(required_vars):
 
 if not TELEGRAM_BOT_TOKEN:
     logger.warning("TELEGRAM_BOT_TOKEN не задан, функция бота будет отключена")
+
+if not OPENROUTER_API_KEY and not CEREBRAS_API_KEY:
+    logger.warning \
+        ("Не заданы ключи для AI-сервисов (OPENROUTER_API_KEY или CEREBRAS_API_KEY), AI-функции будут отключены")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -91,6 +109,23 @@ except Exception as e:
 # Инициализация Telegram бота
 bot = Bot(token=TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else None
 dp = Dispatcher()
+
+# Инициализация AI-клиентов
+openai_client = None
+cerebras_client = None
+
+if OPENROUTER_API_KEY:
+    openai_client = OpenAI(
+        base_url=OPENROUTER_BASE_URL,
+        api_key=OPENROUTER_API_KEY,
+        max_retries=0,  # Disable automatic retries
+        timeout=10.0  # Add timeout
+    )
+
+if CEREBRAS_API_KEY:
+    cerebras_client = Cerebras(
+        api_key=CEREBRAS_API_KEY,
+    )
 
 # Глобальные переменные для хранения состояния устройств
 device_states = {}  # {device_id: {'last_state': bool, 'last_counter': float, 'session_start': datetime}}
@@ -382,6 +417,7 @@ def get_device_status_cloud_enhanced(device_id: str) -> Tuple[bool, float, Optio
 
         logger.info(f"Устройство {device_id}: состояние={'ВКЛ' if is_on else 'ВЫКЛ'}, "
                     f"счетчик={counter:.3f} кВт·ч, мощность={cur_power} Вт")
+
         return result_data
     else:
         logger.error(f"Ошибка получения статуса устройства {device_id}: {status}")
@@ -408,7 +444,7 @@ def get_device_energy_stats_cloud(device_id: str, start_time: datetime, end_time
 
             # Пробуем разные варианты вызова getdevicelog
             try:
-                # Вариант 1: device_id как первый аргумент
+                # Вариант 1: device_id как первый аргумент (позиционный)
                 response = tuya_cloud.getdevicelog(
                     device_id,  # Первый аргумент - device_id
                     start=start_ms,
@@ -419,11 +455,10 @@ def get_device_energy_stats_cloud(device_id: str, start_time: datetime, end_time
                 return response
             except Exception as e1:
                 logger.debug(f"Вариант 1 не сработал: {e1}")
-
                 try:
-                    # Вариант 2: id как именованный аргумент
+                    # Вариант 2: передача device_id как именованного аргумента device_id
                     response = tuya_cloud.getdevicelog(
-                        id=device_id,
+                        device_id=device_id,
                         start=start_ms,
                         end=end_ms,
                         type="7"
@@ -432,21 +467,7 @@ def get_device_energy_stats_cloud(device_id: str, start_time: datetime, end_time
                     return response
                 except Exception as e2:
                     logger.debug(f"Вариант 2 не сработал: {e2}")
-
-                    try:
-                        # Вариант 3: device_id как именованный аргумент
-                        response = tuya_cloud.getdevicelog(
-                            device_id=device_id,
-                            start=start_ms,
-                            end=end_ms,
-                            type="7"
-                        )
-                        logger.debug(f"Ответ статистики для устройства {device_id} (вариант 3): {response}")
-                        return response
-                    except Exception as e3:
-                        logger.debug(f"Вариант 3 не сработал: {e3}")
-                        raise Exception("Все варианты вызова getdevicelog не сработали") from e3
-
+                    raise Exception("Все варианты вызова getdevicelog не сработали") from e2
         except Exception as e:
             logger.error(f"Ошибка запроса статистики устройства {device_id}: {e}")
             return None
@@ -475,6 +496,7 @@ def get_device_energy_stats_cloud(device_id: str, start_time: datetime, end_time
                             continue
 
             energy_kwh = energy_wh / 1000  # Преобразование в кВт·ч
+
             stats_data = {
                 'device_id': device_id,
                 'energy_kwh': energy_kwh,
@@ -486,6 +508,7 @@ def get_device_energy_stats_cloud(device_id: str, start_time: datetime, end_time
 
             # Сохраняем в кэш
             data_cache.set(cache_key, stats_data)
+
             return stats_data
         else:
             # Если основной метод не сработал, используем альтернативный
@@ -534,8 +557,8 @@ def get_device_energy_stats_cloud_alternative(device_id: str, start_time: dateti
 
         # Сохраняем в кэш
         data_cache.set(cache_key, stats_data)
-        return stats_data
 
+        return stats_data
     except Exception as e:
         logger.error(f"Ошибка альтернативного запроса статистики устройства {device_id}: {e}")
         return {
@@ -547,6 +570,7 @@ def get_device_energy_stats_cloud_alternative(device_id: str, start_time: dateti
             'error': str(e)
         }
 
+
 def safe_get_device_data(device_id: str) -> Tuple[bool, float, Optional[dict]]:
     """Безопасное получение данных устройства с обработкой всех возможных ошибок"""
     try:
@@ -557,12 +581,15 @@ def safe_get_device_data(device_id: str) -> Tuple[bool, float, Optional[dict]]:
         # Возвращаем значения по умолчанию
         return False, 0.0, None
 
+
 def get_daily_energy_consumption(device_id: str, date: datetime = None) -> Dict:
     """Получить дневное потребление электроэнергии"""
     if date is None:
         date = datetime.now().date()
+
     start_date = datetime.combine(date, datetime.min.time())
     end_date = start_date + timedelta(days=1)
+
     return get_device_energy_stats_cloud(device_id, start_date, end_date)
 
 
@@ -572,11 +599,13 @@ def get_monthly_energy_consumption(device_id: str, year: int = None, month: int 
         year = datetime.now().year
     if month is None:
         month = datetime.now().month
+
     start_date = datetime(year, month, 1)
     if month == 12:
         end_date = datetime(year + 1, 1, 1)
     else:
         end_date = datetime(year, month + 1, 1)
+
     return get_device_energy_stats_cloud(device_id, start_date, end_date)
 
 
@@ -610,6 +639,7 @@ def get_historical_consumption_pattern(device_id: str, days: int = 7) -> Dict:
 
             # Получаем статистику за день с использованием альтернативного метода при необходимости
             daily_stats = get_device_energy_stats_cloud(device_id, day_start, day_end)
+
             if daily_stats['success']:
                 daily_consumption = daily_stats['energy_kwh']
 
@@ -645,10 +675,10 @@ def get_historical_consumption_pattern(device_id: str, days: int = 7) -> Dict:
 
         logger.debug(f"Исторический паттерн для {device_id}: {patterns}")
         return patterns
-
     except Exception as e:
         logger.error(f"Ошибка анализа исторического паттерна: {e}")
         return patterns
+
 
 def enhanced_estimate_24h_consumption(current_power_w: float, location: str, device_id: str = None) -> Dict[str, float]:
     """Улучшенный расчет прогнозного потребления за 24 часа с учетом исторических данных"""
@@ -721,8 +751,8 @@ def predict_consumption_based_on_sales(device_id: str, location: str, days: int 
         # Получаем данные о продажах за указанный период
         end_date = datetime.now()
         start_date = end_date - timedelta(days=days)
-
         sales_data = get_sales_data(start_date, end_date)
+
         if not sales_data:
             return {}
 
@@ -758,7 +788,6 @@ def predict_consumption_based_on_sales(device_id: str, location: str, days: int 
             'based_on_sales_count': len(sales_data),
             'confidence': 'high' if len(sales_data) > 3 else 'medium'
         }
-
     except Exception as e:
         logger.error(f"Ошибка прогнозирования на основе продаж: {e}")
         return {}
@@ -767,6 +796,7 @@ def predict_consumption_based_on_sales(device_id: str, location: str, days: int 
 def get_current_power_consumption() -> Dict[str, Dict]:
     """Получает текущее потребление мощности всех устройств"""
     logger.info("Запрос текущего потребления мощности")
+
     consumption_data = {}
 
     for device in DEVICES:
@@ -808,6 +838,7 @@ def get_month_consumption_from_api(location: str) -> float:
 
     for device in location_devices:
         device_id = device["device_id"]
+
         # Пробуем получить данные через Cloud API
         monthly_data = get_monthly_energy_consumption(device_id)
         if monthly_data['success']:
@@ -829,6 +860,7 @@ def get_today_consumption_from_api(location: str) -> float:
 
     for device in location_devices:
         device_id = device["device_id"]
+
         # Пробуем получить данные через Cloud API
         daily_data = get_daily_energy_consumption(device_id)
         if daily_data['success']:
@@ -911,6 +943,7 @@ def get_tariff_ranges(location: str, use_fallback: bool = False) -> List[Dict]:
                     {"min_kwh": 150, "max_kwh": 800, "day_rate": 6.11, "night_rate": 4.28},
                     {"min_kwh": 800, "max_kwh": None, "day_rate": 8.13, "night_rate": 5.69}
                 ]
+
         return TARIFF_SETTINGS[location]["ranges"]
     except Exception as e:
         logger.error(f"Ошибка получения тарифов для {location}: {e}", exc_info=True)
@@ -924,19 +957,22 @@ def get_tariff_ranges(location: str, use_fallback: bool = False) -> List[Dict]:
 def split_session_by_zones(start_time: datetime, end_time: datetime) -> Tuple[float, float]:
     """Разделяет время сессии на дневные и ночные часы"""
     logger.debug(f"Разделение сессии на зоны: {start_time} - {end_time}")
+
     day_hours = 0.0
     night_hours = 0.0
-    current_time = start_time
 
+    current_time = start_time
     while current_time < end_time:
         next_hour = current_time.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
         if next_hour > end_time:
             next_hour = end_time
+
         hour = current_time.hour
         if 23 <= hour or hour < 7:  # Ночной тариф: 23:00 - 7:00
             night_hours += (next_hour - current_time).total_seconds() / 3600
         else:
             day_hours += (next_hour - current_time).total_seconds() / 3600
+
         current_time = next_hour
 
     logger.debug(f"Результат разделения: день={day_hours:.2f}ч, ночь={night_hours:.2f}ч")
@@ -980,6 +1016,7 @@ def calculate_session_cost_with_ranges(
     remaining_night_energy = night_energy
     remaining_total_energy = energy_kwh
     current_monthly_kwh = previous_monthly_kwh
+
     cost_details = {
         "ranges": [],
         "tariff_type": tariff_type
@@ -1010,6 +1047,7 @@ def calculate_session_cost_with_ranges(
                     range_cost = energy_in_range * range_data["day_rate"]
 
                 total_cost += range_cost
+
                 cost_details["ranges"].append({
                     "range_name": range_data.get("name", f"{range_min}-{range_max}"),
                     "energy_kwh": energy_in_range,
@@ -1053,6 +1091,7 @@ def calculate_session_cost(
         location_devices = [d for d in DEVICES if d["location"] == location and d["device_id"] == device_id]
         if location_devices:
             previous_monthly_kwh = 0
+
             # Получаем потребление за месяц до начала сессии
             monthly_data = get_monthly_energy_consumption(device_id, month_start.year, month_start.month)
             if monthly_data['success']:
@@ -1064,6 +1103,7 @@ def calculate_session_cost(
                     "miner_device_id", device_id).gte(
                     "session_start_time", month_start.isoformat()).lt(
                     "session_start_time", start_time.isoformat()).execute()
+
                 previous_monthly_kwh = sum(session["energy_kwh"] for session in response.data)
                 use_fallback = previous_monthly_kwh == 0  # Используем запасной тариф если нет данных
 
@@ -1095,6 +1135,7 @@ def save_session(
 ):
     """Сохраняет сессию в базу данных"""
     logger.info(f"Сохранение сессии в базу данных")
+
     try:
         session_data = {
             "miner_device_id": device_id,
@@ -1105,12 +1146,20 @@ def save_session(
             "cost_rub": cost_rub,
             "tariff_type": tariff_type,
             "day_energy_kwh": day_energy,
-            "night_energy_kwh": night_energy,
-            "cost_details": json.dumps(cost_details)
+            "night_energy_kwh": night_energy
         }
+
+        # Try to include cost_details if column exists
+        try:
+            session_data["cost_details"] = json.dumps(cost_details)
+        except Exception as e:
+            logger.warning(f"Could not include cost_details: {e}")
+
         response = supabase.table("miner_energy_sessions").insert(session_data).execute()
+
         logger.info(
             f"Сессия успешно сохранена: {device_id}, энергия: {energy_kwh:.3f} кВт·ч, стоимость: {cost_rub:.2f} руб.")
+
         return response.data[0] if response.data else None
     except Exception as e:
         logger.error(f"Ошибка сохранения сессии: {e}", exc_info=True)
@@ -1123,6 +1172,7 @@ def get_sales_data(start_date: datetime, end_date: datetime) -> List[Dict]:
         response = supabase.table("miner_sales").select("*").gte(
             "executed_at", start_date.isoformat()).lt(
             "executed_at", end_date.isoformat()).execute()
+
         return response.data if response.data else []
     except Exception as e:
         logger.error(f"Ошибка получения данных о продажах: {e}", exc_info=True)
@@ -1135,6 +1185,7 @@ def get_energy_data(start_date: datetime, end_date: datetime) -> List[Dict]:
         response = supabase.table("miner_energy_sessions").select("*").gte(
             "session_start_time", start_date.isoformat()).lt(
             "session_start_time", end_date.isoformat()).execute()
+
         return response.data if response.data else []
     except Exception as e:
         logger.error(f"Ошибка получения данных о потреблении: {e}", exc_info=True)
@@ -1148,6 +1199,7 @@ def calculate_profitability_for_period(
 ) -> Dict:
     """Рассчитывает доходность за указанный период с учетом курса валют"""
     logger.info(f"Расчет доходности за период {period_name}: {start_date} - {end_date}")
+
     try:
         # Получаем текущий курс валют
         exchange_rate = ExchangeRateManager.get_usdt_rub_rate()
@@ -1203,6 +1255,7 @@ def calculate_profitability_for_period(
 
         for session in energy_data:
             location = session["miner_location"]
+
             if location not in location_stats:
                 location_stats[location] = {
                     "total_energy": 0.0,
@@ -1217,6 +1270,7 @@ def calculate_profitability_for_period(
             location_stats[location]["day_energy"] += session["day_energy_kwh"]
             location_stats[location]["night_energy"] += session["night_energy_kwh"]
             location_stats[location]["devices"].add(session["miner_device_id"])
+
             total_cost += session["cost_rub"]
 
         # Рассчитываем чистую прибыль и рентабельность
@@ -1267,6 +1321,7 @@ def calculate_profitability_for_period(
                 "sales_count": len(sales_data),
                 "energy_sessions_count": len(energy_data)
             }
+
             supabase.table("miner_profitability_history").insert(profit_data).execute()
         except Exception as e:
             logger.error(f"Ошибка сохранения данных о доходности: {e}")
@@ -1281,7 +1336,9 @@ def calculate_daily_profitability(date: datetime = None):
     """Рассчитывает дневную доходность майнинга на основе реальных продаж"""
     if date is None:
         date = datetime.now().date()
+
     logger.info(f"Расчет дневной доходности за {date}")
+
     try:
         start_date = datetime.combine(date, datetime.min.time())
         end_date = start_date + timedelta(days=1)
@@ -1289,8 +1346,9 @@ def calculate_daily_profitability(date: datetime = None):
         # Рассчитываем доходность за день
         profitability_data = calculate_profitability_for_period(start_date, end_date,
                                                                 f"День {date.strftime('%d.%m.%Y')}")
+
         if profitability_data:
-            # Сохраняем в таблицу дневной доходности
+            # Сохраняем в таблицу дневной доходности с использованием UPSERT
             daily_profit_data = {
                 "calculation_date": date.isoformat(),
                 "total_income_rub": profitability_data["total_income_rub"],
@@ -1300,7 +1358,11 @@ def calculate_daily_profitability(date: datetime = None):
                 "sales_count": profitability_data["sales_count"],
                 "energy_sessions_count": profitability_data["energy_sessions_count"]
             }
-            supabase.table("miner_daily_profitability").insert(daily_profit_data).execute()
+
+            supabase.table("miner_daily_profitability").upsert(
+                daily_profit_data,
+                on_conflict="calculation_date"
+            ).execute()
 
             logger.info(f"Дневная доходность за {date}:")
             logger.info(
@@ -1318,12 +1380,15 @@ def calculate_weekly_profitability(end_date: datetime = None):
     """Рассчитывает недельную доходность и среднесуточные показатели"""
     if end_date is None:
         end_date = datetime.now()
+
     start_date = end_date - timedelta(days=7)
     logger.info(f"Расчет недельной доходности: {start_date} - {end_date}")
+
     try:
         # Рассчитываем доходность за неделю
         weekly_data = calculate_profitability_for_period(start_date, end_date,
                                                          f"Неделя {start_date.strftime('%d.%m')} - {end_date.strftime('%d.%m.%Y')}")
+
         if weekly_data:
             # Рассчитываем среднесуточную доходность за неделю
             avg_daily_profitability = {
@@ -1339,7 +1404,7 @@ def calculate_weekly_profitability(end_date: datetime = None):
                 "exchange_rate_source": weekly_data["exchange_rate_source"]
             }
 
-            # Сохраняем в таблицу недельной доходности
+            # Сохраняем в таблицу недельной доходности с использованием UPSERT
             weekly_profit_data = {
                 "start_date": start_date.isoformat(),
                 "end_date": end_date.isoformat(),
@@ -1353,7 +1418,25 @@ def calculate_weekly_profitability(end_date: datetime = None):
                 "sales_count": weekly_data["sales_count"],
                 "energy_sessions_count": weekly_data["energy_sessions_count"]
             }
-            supabase.table("miner_weekly_profitability").insert(weekly_profit_data).execute()
+
+            # Используем insert вместо upsert для избежания ошибки с ограничением
+            try:
+                # Сначала проверяем, существует ли уже запись за эту неделю
+                existing_record = supabase.table("miner_weekly_profitability").select("*").eq(
+                    "start_date", start_date.isoformat()).execute()
+
+                if existing_record.data:
+                    # Если запись существует, обновляем ее
+                    supabase.table("miner_weekly_profitability").update(
+                        weekly_profit_data
+                    ).eq("start_date", start_date.isoformat()).execute()
+                else:
+                    # Если записи нет, вставляем новую
+                    supabase.table("miner_weekly_profitability").insert(
+                        weekly_profit_data
+                    ).execute()
+            except Exception as e:
+                logger.error(f"Ошибка сохранения недельной доходности: {e}")
 
             logger.info(f"Недельная доходность:")
             logger.info(
@@ -1373,14 +1456,17 @@ def calculate_monthly_profitability(end_date: datetime = None):
     """Рассчитывает месячную доходность"""
     if end_date is None:
         end_date = datetime.now()
+
     start_date = end_date - timedelta(days=30)
     logger.info(f"Расчет месячной доходности: {start_date} - {end_date}")
+
     try:
         # Рассчитываем доходность за месяц
         monthly_data = calculate_profitability_for_period(start_date, end_date,
                                                           f"Месяц {start_date.strftime('%d.%m')} - {end_date.strftime('%d.%m.%Y')}")
+
         if monthly_data:
-            # Сохраняем в таблицу месячной доходности
+            # Сохраняем в таблицу месячной доходности с использованием UPSERT
             monthly_profit_data = {
                 "start_date": start_date.isoformat(),
                 "end_date": end_date.isoformat(),
@@ -1394,7 +1480,11 @@ def calculate_monthly_profitability(end_date: datetime = None):
                 "sales_count": monthly_data["sales_count"],
                 "energy_sessions_count": monthly_data["energy_sessions_count"]
             }
-            supabase.table("miner_monthly_profitability").insert(monthly_profit_data).execute()
+
+            supabase.table("miner_monthly_profitability").upsert(
+                monthly_profit_data,
+                on_conflict="start_date"
+            ).execute()
 
             logger.info(f"Месячная доходность:")
             logger.info(
@@ -1414,12 +1504,15 @@ def calculate_3day_profitability(end_date: datetime = None):
     """Рассчитывает доходность за последние 3 дня"""
     if end_date is None:
         end_date = datetime.now()
+
     start_date = end_date - timedelta(days=3)
     logger.info(f"Расчет 3-дневной доходности: {start_date} - {end_date}")
+
     try:
         # Рассчитываем доходность за 3 дня
         data_3d = calculate_profitability_for_period(start_date, end_date,
                                                      f"3 дня {start_date.strftime('%d.%m')} - {end_date.strftime('%d.%m.%Y')}")
+
         if data_3d:
             # Рассчитываем среднесуточную доходность за 3 дня
             avg_daily_profitability = {
@@ -1449,7 +1542,26 @@ def calculate_3day_profitability(end_date: datetime = None):
                 "sales_count": data_3d["sales_count"],
                 "energy_sessions_count": data_3d["energy_sessions_count"]
             }
-            supabase.table("miner_3day_profitability").insert(profit_data).execute()
+
+            # Пытаемся сохранить данные, но продолжаем работу даже если не получится
+            try:
+                response = supabase.table("miner_3day_profitability").upsert(
+                    profit_data,
+                    on_conflict="start_date"
+                ).execute()
+
+                if response.data:
+                    logger.info(f"3-дневная доходность успешно сохранена")
+                else:
+                    logger.warning(f"Не удалось сохранить 3-дневную доходность: пустой ответ")
+            except Exception as e:
+                error_msg = str(e).lower()
+                if "404" in error_msg or "not found" in error_msg:
+                    logger.warning(f"Таблица miner_3day_profitability не найдена. Пропуск сохранения в базу данных.")
+                    logger.info("Для создания таблицы выполните SQL скрипт: create_3day_profitability_table.sql")
+                else:
+                    logger.warning(f"Не удалось сохранить 3-дневную доходность в базу данных: {e}")
+                logger.info("Продолжаем работу без сохранения в базу данных")
 
             logger.info(f"3-дневная доходность:")
             logger.info(
@@ -1460,6 +1572,9 @@ def calculate_3day_profitability(end_date: datetime = None):
             logger.info(f"  Среднесуточная прибыль: {data_3d['avg_daily_profit']:.2f} RUB")
 
             return data_3d, avg_daily_profitability
+        else:
+            logger.error("Не удалось рассчитать 3-дневную доходность: пустые данные")
+            return None, None
     except Exception as e:
         logger.error(f"Ошибка расчета 3-дневной доходности: {e}", exc_info=True)
         return None, None
@@ -1468,6 +1583,7 @@ def calculate_3day_profitability(end_date: datetime = None):
 def get_today_spending() -> Dict[str, Dict]:
     """Получает статистику потребления за сегодня"""
     logger.info("Запрос статистики за сегодня")
+
     today = datetime.now().date()
     start_date = datetime.combine(today, datetime.min.time())
     end_date = start_date + timedelta(days=1)
@@ -1492,6 +1608,7 @@ def get_today_spending() -> Dict[str, Dict]:
             response = supabase.table("miner_energy_sessions").select("*").gte(
                 "session_start_time", start_date.isoformat()).lt(
                 "session_start_time", end_date.isoformat()).execute()
+
             sessions = response.data
         else:
             sessions = []
@@ -1673,6 +1790,10 @@ async def cmd_start(message: types.Message):
         "/profitall - Показать доходность за все периоды\n"
         "/devices - Показать статус устройств\n"
         "/api_status - Показать статус использования API\n"
+        "/ai_analyze - AI-анализ текущей ситуации\n"
+        "/ai_forecast - AI-прогноз энергопотребления\n"
+        "/ai_optimize - AI-оптимизация доходности\n"
+        "/ai_health - AI-проверка здоровья системы\n"
         "/help - Помощь"
     )
 
@@ -1689,18 +1810,22 @@ async def cmd_help(message: types.Message):
 /profit30d - Показать месячную доходность и среднесуточные показатели
 /profitall - Показать сводную доходность за все периоды (24ч, 7д, 30д)
 /devices - Показать текущий статус всех устройств
-/api_status - Показать статус использования Tuya API
+/api_status - Показать статус использования Tuya AI
+/ai_analyze - AI-анализ текущей ситуации майнинга
+/ai_forecast [период] - AI-прогноз энергопотребления (24h, 7d, 30d)
+/ai_optimize - AI-оптимизация доходности майнинга
+/ai_health - AI-проверка здоровья системы
 /help - Показать эту справку
 
 📊 <b>Формат вывода:</b>
 • Реальная доходность на основе данных о продажах из таблицы miner_sales
-• Фактическое потребление за сегодня (из API или базы данных)
+• Фактическое потребление за сегодня (из AI или базы данных)
 • Прогноз на 24 часа при текущей мощности с учетом исторических данных
 • Стоимость в рублях с учетом курса USDT/RUB
 • Разделение на дневное/ночное потребление
 • Статистика по каждому устройству
 
-⚠️ <b>Ограничения API:</b>
+⚠️ <b>Ограничения AI:</b>
 • 500,000 запросов в день
 • 500 запросов в секунду
 • Данные кэшируются на 1 час
@@ -1714,11 +1839,11 @@ async def cmd_help(message: types.Message):
 • Рентабельность = (Чистая прибыль / Затраты) * 100%
 • Среднесуточные показатели рассчитываются для периодов больше 1 дня
 
-🔮 <b>Прогнозирование:</b>
-• Учитывает исторические паттерны потребления
-• Анализирует эффективность майнинга (кВт·ч на 1 USDT)
-• Корректирует прогноз на основе данных о продажах
-• Показывает уровень достоверности прогноза
+🔮 <b>AI-функции:</b>
+• Анализ текущей ситуации с учетом рыночных условий
+• Прогнозирование энергопотребления на основе исторических данных
+• Оптимизация доходности с учетом тарифов и эффективности
+• Обнаружение аномалий и проблем в системе
 """
     await message.reply(help_text, parse_mode=ParseMode.HTML)
 
@@ -1726,12 +1851,13 @@ async def cmd_help(message: types.Message):
 @dp.message(Command("api_status"))
 async def cmd_api_status(message: types.Message):
     """Обработчик команды /api_status"""
-    logger.info(f"Пользователь {message.from_user.id} запросил статус API")
+    logger.info(f"Пользователь {message.from_user.id} запросил статус AI")
+
     status = api_limiter.get_status()
     cache_size = len(data_cache.cache)
     rate_info = ExchangeRateManager.get_rate_info()
 
-    status_text = f"📊 <b>Статус Tuya API:</b>\n\n"
+    status_text = f"📊 <b>Статус Tuya AI:</b>\n\n"
     status_text += f"📈 Запросов сегодня: {status['requests_today']}/{status['daily_limit']}\n"
     status_text += f"⚡ Запросов в секунду: {status['requests_per_second']}/{status['second_limit']}\n"
     status_text += f"💾 Кэшированных записей: {cache_size}\n\n"
@@ -1746,9 +1872,10 @@ async def cmd_api_status(message: types.Message):
         status_text += "❌ Курс недоступен\n"
 
     if status['requests_today'] > status['daily_limit'] * 0.8:
-        status_text += "\n⚠️ <b>Внимание!</b> Вы приближаетесь к дневному лимиту API!\n"
+        status_text += "\n⚠️ <b>Внимание!</b> Вы приближаетесь к дневному лимиту AI!\n"
+
     if status['requests_per_second'] > status['second_limit'] * 0.8:
-        status_text += "⚠️ <b>Внимание!</b> Высокая нагрузка на API!\n"
+        status_text += "⚠️ <b>Внимание!</b> Высокая нагрузка на AI!\n"
 
     await message.reply(status_text, parse_mode=ParseMode.HTML)
 
@@ -1763,7 +1890,22 @@ async def cmd_last(message: types.Message):
 
     if data_3d and avg_daily_data:
         response_text = format_profitability_message(data_3d, show_details=False)
-        response_text += f"\n\n{format_profitability_message(avg_daily_data, show_details=False)}"
+
+        # Fix for average daily data - use the actual values from data_3d
+        fixed_avg_daily_data = {
+            "period_name": "Среднесуточная за 3 дня",
+            "total_income_usdt": data_3d.get("total_income_usdt", 0) / 3,
+            "total_income_rub": data_3d.get("total_income_rub", 0) / 3,
+            "total_cost": data_3d.get("total_cost", 0) / 3,
+            "net_profit": data_3d.get("net_profit", 0) / 3,
+            "profitability_percentage": data_3d.get("profitability_percentage", 0),
+            "exchange_rate": data_3d.get("exchange_rate"),
+            "exchange_rate_source": data_3d.get("exchange_rate_source", "CoinGecko"),
+            "sales_count": max(1, data_3d.get("sales_count", 0) // 3),  # Avoid division by zero
+            "location_stats": data_3d.get("location_stats", {})
+        }
+
+        response_text += f"\n\n{format_profitability_message(fixed_avg_daily_data, show_details=False)}"
 
         # Добавляем прогноз на следующие 3 дня на основе текущей мощности
         current_consumption = get_current_power_consumption()
@@ -2137,6 +2279,549 @@ async def cmd_devices(message: types.Message):
     await message.reply(response_text, parse_mode=ParseMode.HTML)
 
 
+# Function to sanitize AI responses for Telegram
+def sanitize_for_telegram_html(text):
+    """Sanitize AI response to prevent Telegram parsing errors"""
+    if not text:
+        return ""
+
+    # Remove problematic HTML tags that might cause parsing issues
+    # Keep only basic formatting tags that Telegram supports
+    allowed_tags = ['b', 'i', 'u', 's', 'a', 'code', 'pre']
+
+    # Pattern to match HTML tags
+    tag_pattern = re.compile(r'</?([a-zA-Z0-9]+)(?:\s+[^>]*)?>')
+
+    def replace_tag(match):
+        tag_name = match.group(1).lower()
+        if tag_name in allowed_tags:
+            return match.group(0)  # Keep allowed tags
+        return ""  # Remove disallowed tags
+
+    # Replace disallowed tags
+    sanitized = tag_pattern.sub(replace_tag, text)
+
+    # Fix common HTML issues
+    sanitized = sanitized.replace("&nbsp;", " ")  # Replace non-breaking spaces
+    sanitized = sanitized.replace("&amp;", "&")  # Fix ampersands
+    sanitized = sanitized.replace("&lt;", "<")  # Fix less than
+    sanitized = sanitized.replace("&gt;", ">")  # Fix greater than
+
+    # Remove any remaining HTML entities that might cause issues
+    sanitized = re.sub(r'&[a-zA-Z0-9#]+;', '', sanitized)
+
+    return sanitized
+
+
+# Function to split long messages for Telegram
+def split_message_for_telegram(text, max_length=4096):
+    """Split a long message into multiple parts for Telegram"""
+    if len(text) <= max_length:
+        return [text]
+
+    parts = []
+    current_part = ""
+
+    # Split by paragraphs first
+    paragraphs = text.split('\n\n')
+
+    for paragraph in paragraphs:
+        # If adding this paragraph would exceed the limit, start a new part
+        if len(current_part) + len(paragraph) + 2 > max_length:
+            if current_part:  # Save current part if not empty
+                parts.append(current_part)
+                current_part = ""
+
+            # If a single paragraph is too long, split it by lines
+            if len(paragraph) > max_length:
+                lines = paragraph.split('\n')
+                for line in lines:
+                    if len(current_part) + len(line) + 1 > max_length:
+                        if current_part:
+                            parts.append(current_part)
+                            current_part = line
+                        else:
+                            # If a single line is too long, split it by words
+                            words = line.split(' ')
+                            for word in words:
+                                if len(current_part) + len(word) + 1 > max_length:
+                                    if current_part:
+                                        parts.append(current_part)
+                                        current_part = word
+                                    else:
+                                        # If a single word is too long, split it
+                                        while len(word) > max_length:
+                                            parts.append(word[:max_length])
+                                            word = word[max_length:]
+                                        current_part = word
+                                else:
+                                    if current_part:
+                                        current_part += " " + word
+                                    else:
+                                        current_part = word
+                    else:
+                        if current_part:
+                            current_part += "\n" + line
+                        else:
+                            current_part = line
+            else:
+                current_part = paragraph
+        else:
+            if current_part:
+                current_part += "\n\n" + paragraph
+            else:
+                current_part = paragraph
+
+    # Add the last part if not empty
+    if current_part:
+        parts.append(current_part)
+
+    return parts
+
+
+# Function to execute AI requests with proper error handling
+async def make_ai_request(system_prompt, user_prompt, temperature=0.7, max_tokens=1500):
+    """Execute AI request with proper rate limiting handling"""
+    # Try OpenRouter first
+    if openai_client:
+        try:
+            response = openai_client.chat.completions.create(
+                model=REASONING_MODEL,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=temperature,
+                max_tokens=max_tokens,
+                extra_headers={
+                    "HTTP-Referer": OPENROUTER_SITE_URL,
+                    "X-Title": OPENROUTER_SITE_NAME,
+                },
+                timeout=10  # Add timeout to prevent hanging
+            )
+            return response.choices[0].message.content, "OpenRouter"
+        except Exception as e:
+            error_msg = str(e)
+            logger.warning(f"OpenRouter request failed: {error_msg}")
+            # Check for rate limiting errors
+            if "429" in error_msg or "rate limit" in error_msg.lower():
+                logger.info("Rate limit exceeded on OpenRouter, switching to Cerebras")
+            # Continue to Cerebras below
+
+    # Fallback to Cerebras
+    if cerebras_client:
+        try:
+            response = cerebras_client.chat.completions.create(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                model=CEREBRAS_MODEL,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                timeout=10  # Add timeout
+            )
+            return response.choices[0].message.content, "Cerebras"
+        except Exception as e:
+            logger.warning(f"Cerebras request failed: {e}")
+
+    # Both providers failed
+    return None, None
+
+
+# AI-команды
+@dp.message(Command("ai_analyze"))
+async def cmd_ai_analyze(message: types.Message):
+    """AI-анализ текущей ситуации"""
+    logger.info(f"Пользователь {message.from_user.id} запросил AI-анализ")
+
+    # Проверяем, доступен ли хотя бы один AI-провайдер
+    if not openai_client and not cerebras_client:
+        await message.reply("❌ AI-сервисы недоступны. Проверьте настройки API ключей.")
+        return
+
+    try:
+        # Получаем текущие данные
+        current_consumption = get_current_power_consumption()
+        total_power = sum(loc['total_power_w'] for loc in current_consumption.values())
+
+        # Получаем данные о продажах за последние 24 часа
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=1)
+        sales_data = get_sales_data(start_date, end_date)
+        total_income_usdt = sum(float(sale.get("total_received", 0)) for sale in sales_data)
+
+        # Получаем курс валюты
+        exchange_rate = ExchangeRateManager.get_usdt_rub_rate()
+
+        # Формируем промпт для AI
+        prompt = f"""
+        Проанализируй текущую ситуацию майнинг-фермы на основе следующих данных:
+        Текущая мощность: {total_power} Вт
+        Доход за последние 24 часа: {total_income_usdt} USDT
+        Курс USDT/RUB: {exchange_rate} руб
+        Локации и устройства:
+        """
+
+        for location, data in current_consumption.items():
+            prompt += f"\n{location}: {data['total_power_w']} Вт, устройств: {len(data['devices'])}"
+            for device in data['devices']:
+                prompt += f"\n  - {device['name']}: {device['power_w']} Вт ({'ВКЛ' if device['is_on'] else 'ВЫКЛ'})"
+
+        prompt += """
+        Предоставь анализ на русском языке, включающий:
+        1. Общую оценку текущей ситуации
+        2. Эффективность работы фермы
+        3. Потенциальные проблемы или риски
+        4. Рекомендации по оптимизации
+        5. Прогноз на ближайшие 24 часа
+        Ответ структурируй по пунктам с использованием эмодзи.
+        """
+
+        # Запрос к AI с использованием резервных провайдеров
+        ai_analysis, provider = await make_ai_request(
+            system_prompt="Ты - эксперт по анализу криптомайнинга. Отвечай подробно и структурированно на русском языке.",
+            user_prompt=prompt,
+            temperature=0.7,
+            max_tokens=1500
+        )
+
+        if ai_analysis:
+            # Sanitize the AI response
+            sanitized_analysis = sanitize_for_telegram_html(ai_analysis)
+
+            # Format the response
+            response_text = f"🤖 <b>AI-Анализ Текущей Ситуации</b> (через {provider})\n\n{sanitized_analysis}"
+
+            # Split the message if it's too long
+            message_parts = split_message_for_telegram(response_text)
+
+            # Send each part
+            for i, part in enumerate(message_parts):
+                try:
+                    # Add continuation indicator for multi-part messages
+                    if len(message_parts) > 1:
+                        part = f"📄 Часть {i + 1}/{len(message_parts)}\n\n{part}"
+
+                    # Try sending with HTML formatting
+                    await message.reply(part, parse_mode=ParseMode.HTML)
+                except Exception as e:
+                    logger.error(f"HTML parsing error in part {i + 1}: {e}")
+                    # Fallback to plain text if HTML fails
+                    clean_text = re.sub(r'<[^>]*>', '', part)
+                    await message.reply(clean_text)
+        else:
+            await message.reply("❌ Не удалось получить ответ от AI-сервисов. Попробуйте позже.")
+    except Exception as e:
+        logger.error(f"Ошибка в AI-анализе: {e}")
+        await message.reply("❌ Произошла ошибка при выполнении AI-анализа")
+
+
+@dp.message(Command("ai_forecast"))
+async def cmd_ai_forecast(message: types.Message):
+    """AI-прогноз энергопотребления"""
+    logger.info(f"Пользователь {message.from_user.id} запросил AI-прогноз")
+
+    # Проверяем, доступен ли хотя бы один AI-провайдер
+    if not openai_client and not cerebras_client:
+        await message.reply("❌ AI-сервисы недоступны. Проверьте настройки API ключей.")
+        return
+
+    # Парсим период из команды
+    parts = message.text.split()
+    period = "24h"  # По умолчанию
+    if len(parts) > 1:
+        period = parts[1].lower()
+
+    try:
+        # Получаем текущие данные
+        current_consumption = get_current_power_consumption()
+        total_power = sum(loc['total_power_w'] for loc in current_consumption.values())
+
+        # Получаем исторические данные
+        historical_data = {}
+        for device in DEVICES:
+            device_id = device["device_id"]
+            pattern = get_historical_consumption_pattern(device_id, 7)
+            historical_data[device_id] = pattern
+
+        # Формируем промпт для AI
+        prompt = f"""
+        Сделай прогноз энергопотребления майнинг-фермы на период {period} на основе следующих данных:
+        Текущая общая мощность: {total_power} Вт
+        Исторические паттерны потребления (за последние 7 дней):
+        """
+
+        for device_id, pattern in historical_data.items():
+            device_name = next((d["name"] for d in DEVICES if d["device_id"] == device_id), device_id)
+            prompt += f"\n{device_name}:"
+            prompt += f"\n  - Среднесуточное потребление: {pattern['daily_total']:.3f} кВт·ч"
+            prompt += f"\n  - Пиковые часы: {pattern['peak_hours']}"
+            prompt += f"\n  - Эффективность: {pattern['efficiency']:.2f}"
+
+        prompt += f"""
+        Учитывай следующие факторы:
+        - Текущие погодные условия (если известны)
+        - Сезонные колебания
+        - Исторические тренды
+        - Эффективность устройств
+
+        Предоставь прогноз на русском языке, включающий:
+        1. Прогноз общего потребления на период {period}
+        2. Ожидаемое распределение по часам
+        3. Факторы, влияющие на прогноз
+        4. Рекомендации по оптимизации потребления
+        5. Уровень уверенности в прогнозе
+        Ответ структурируй по пунктам с использованием эмодзи.
+        """
+
+        # Запрос к AI с использованием резервных провайдеров
+        ai_forecast, provider = await make_ai_request(
+            system_prompt="Ты - эксперт по прогнозированию энергопотребления. Отвечай точно и обоснованно на русском языке.",
+            user_prompt=prompt,
+            temperature=0.5,
+            max_tokens=1500
+        )
+
+        if ai_forecast:
+            # Sanitize the AI response
+            sanitized_forecast = sanitize_for_telegram_html(ai_forecast)
+
+            # Format the response
+            period_text = {
+                "24h": "24 часа",
+                "7d": "7 дней",
+                "30d": "30 дней"
+            }.get(period, period)
+
+            response_text = f"🔮 <b>AI-Прогноз на {period_text}</b> (через {provider})\n\n{sanitized_forecast}"
+
+            # Split the message if it's too long
+            message_parts = split_message_for_telegram(response_text)
+
+            # Send each part
+            for i, part in enumerate(message_parts):
+                try:
+                    # Add continuation indicator for multi-part messages
+                    if len(message_parts) > 1:
+                        part = f"📄 Часть {i + 1}/{len(message_parts)}\n\n{part}"
+
+                    # Try sending with HTML formatting
+                    await message.reply(part, parse_mode=ParseMode.HTML)
+                except Exception as e:
+                    logger.error(f"HTML parsing error in part {i + 1}: {e}")
+                    # Fallback to plain text if HTML fails
+                    clean_text = re.sub(r'<[^>]*>', '', part)
+                    await message.reply(clean_text)
+        else:
+            await message.reply("❌ Не удалось получить ответ от AI-сервисов. Попробуйте позже.")
+    except Exception as e:
+        logger.error(f"Ошибка в AI-прогнозе: {e}")
+        await message.reply("❌ Произошла ошибка при выполнении AI-прогноза")
+
+
+@dp.message(Command("ai_optimize"))
+async def cmd_ai_optimize(message: types.Message):
+    """AI-оптимизация доходности"""
+    logger.info(f"Пользователь {message.from_user.id} запросил AI-оптимизацию")
+
+    # Проверяем, доступен ли хотя бы один AI-провайдер
+    if not openai_client and not cerebras_client:
+        await message.reply("❌ AI-сервисы недоступны. Проверьте настройки API ключей.")
+        return
+
+    try:
+        # Получаем текущие данные
+        current_consumption = get_current_power_consumption()
+        total_power = sum(loc['total_power_w'] for loc in current_consumption.values())
+
+        # Получаем данные о доходности за последние 7 дней
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=7)
+        profitability_data = calculate_profitability_for_period(start_date, end_date, "7 дней")
+
+        # Получаем тарифные данные
+        tariff_info = {}
+        for location in set(device["location"] for device in DEVICES):
+            tariff_info[location] = TARIFF_SETTINGS.get(location, {})
+
+        # Формируем промпт для AI
+        prompt = f"""
+        Проанализируй и предложи план оптимизации доходности майнинг-фермы на основе следующих данных:
+        Текущая мощность: {total_power} Вт
+        Доходность за последние 7 дней:
+        - Общий доход: {profitability_data.get('total_income_usdt', 0):.2f} USDT
+        - Общие затраты: {profitability_data.get('total_cost', 0):.2f} RUB
+        - Чистая прибыль: {profitability_data.get('net_profit', 0):.2f} RUB
+        - Рентабельность: {profitability_data.get('profitability_percentage', 0):.2f}%
+
+        Тарифы по локациям:
+        """
+
+        for location, tariff in tariff_info.items():
+            prompt += f"\n{location}:"
+            if tariff.get("tariff_type") == "day_night":
+                ranges = tariff.get("ranges", [])
+                if ranges:
+                    prompt += f"\n  - Дневной тариф: {ranges[0].get('day_rate', 0)} руб/кВт·ч"
+                    prompt += f"\n  - Ночной тариф: {ranges[0].get('night_rate', 0)} руб/кВт·ч"
+            else:
+                ranges = tariff.get("ranges", [])
+                if ranges:
+                    prompt += f"\n  - Единый тариф: {ranges[0].get('day_rate', 0)} руб/кВт·ч"
+
+        prompt += """
+        Предоставь план оптимизации на русском языке, включающий:
+        1. Анализ текущей эффективности
+        2. Конкретные рекомендации по:
+           - Оптимизации расписания работы устройств
+           - Использованию тарифных зон (день/ночь)
+           - Повышению эффективности майнинга
+           - Снижению затрат на электричество
+        3. Оценку потенциального улучшения доходности
+        4. Пошаговый план внедрения рекомендаций
+        5. Сроки окупаемости предлагаемых мер
+        Ответ структурируй по пунктам с использованием эмодзи.
+        """
+
+        # Запрос к AI с использованием резервных провайдеров
+        ai_optimization, provider = await make_ai_request(
+            system_prompt="Ты - эксперт по оптимизации криптомайнинга. Отвечай практично и конкретно на русском языке.",
+            user_prompt=prompt,
+            temperature=0.7,
+            max_tokens=1500
+        )
+
+        if ai_optimization:
+            # Sanitize the AI response
+            sanitized_optimization = sanitize_for_telegram_html(ai_optimization)
+
+            # Format the response
+            response_text = f"⚡ <b>AI-Оптимизация Доходности</b> (через {provider})\n\n{sanitized_optimization}"
+
+            # Split the message if it's too long
+            message_parts = split_message_for_telegram(response_text)
+
+            # Send each part
+            for i, part in enumerate(message_parts):
+                try:
+                    # Add continuation indicator for multi-part messages
+                    if len(message_parts) > 1:
+                        part = f"📄 Часть {i + 1}/{len(message_parts)}\n\n{part}"
+
+                    # Try sending with HTML formatting
+                    await message.reply(part, parse_mode=ParseMode.HTML)
+                except Exception as e:
+                    logger.error(f"HTML parsing error in part {i + 1}: {e}")
+                    # Fallback to plain text if HTML fails
+                    clean_text = re.sub(r'<[^>]*>', '', part)
+                    await message.reply(clean_text)
+        else:
+            await message.reply("❌ Не удалось получить ответ от AI-сервисов. Попробуйте позже.")
+    except Exception as e:
+        logger.error(f"Ошибка в AI-оптимизации: {e}")
+        await message.reply("❌ Произошла ошибка при выполнении AI-оптимизации")
+
+
+@dp.message(Command("ai_health"))
+async def cmd_ai_health(message: types.Message):
+    """AI-проверка здоровья системы"""
+    logger.info(f"Пользователь {message.from_user.id} запросил AI-проверку здоровья")
+
+    # Проверяем, доступен ли хотя бы один AI-провайдер
+    if not openai_client and not cerebras_client:
+        await message.reply("❌ AI-сервисы недоступны. Проверьте настройки API ключей.")
+        return
+
+    try:
+        # Получаем текущие данные по устройствам
+        device_status = []
+        for device in DEVICES:
+            device_id = device["device_id"]
+            device_name = device["name"]
+            location = device["location"]
+
+            is_on, counter, device_data = get_device_status_cloud_enhanced(device_id)
+
+            status_info = {
+                "name": device_name,
+                "location": location,
+                "is_on": is_on,
+                "power": device_data.get('cur_power', 0) if device_data else 0,
+                "temperature": device_data.get('cur_voltage', 0) if device_data else 0,
+                # Используем напряжение как индикатор
+                "counter": counter
+            }
+            device_status.append(status_info)
+
+        # Формируем промпт для AI
+        prompt = """
+        Проанализируй здоровье майнинг-фермы на основе статусов устройств:
+        """
+
+        for device in device_status:
+            status_emoji = "🟢" if device["is_on"] else "🔴"
+            prompt += f"\n{status_emoji} {device['name']} ({device['location']}):"
+            prompt += f"\n  - Состояние: {'ВКЛ' if device['is_on'] else 'ВЫКЛ'}"
+            prompt += f"\n  - Мощность: {device['power']} Вт"
+            prompt += f"\n  - Напряжение: {device['temperature']} В"
+            prompt += f"\n  - Счетчик: {device['counter']:.3f} кВт·ч"
+
+        prompt += """
+        Проверь наличие аномалий и проблем:
+        - Устройства с необычно высокой/низкой мощностью
+        - Устройства с отклонениями напряжения
+        - Резкие изменения в показаниях счетчиков
+        - Неработающие устройства
+
+        Предоставь анализ здоровья системы на русском языке, включающий:
+        1. Общую оценку состояния системы
+        2. Выявленные аномалии или проблемы
+        3. Рекомендации по устранению проблем
+        4. Профилактические меры
+        5. Оценку критичности выявленных проблем
+        Ответ структурируй по пунктам с использованием эмодзи.
+        """
+
+        # Запрос к AI с использованием резервных провайдеров
+        ai_health, provider = await make_ai_request(
+            system_prompt="Ты - эксперт по диагностике майнингового оборудования. Отвечай внимательно и профессионально на русском языке.",
+            user_prompt=prompt,
+            temperature=0.5,
+            max_tokens=1500
+        )
+
+        if ai_health:
+            # Sanitize the AI response
+            sanitized_health = sanitize_for_telegram_html(ai_health)
+
+            # Format the response
+            response_text = f"🏥 <b>AI-Проверка Здоровья Системы</b> (через {provider})\n\n{sanitized_health}"
+
+            # Split the message if it's too long
+            message_parts = split_message_for_telegram(response_text)
+
+            # Send each part
+            for i, part in enumerate(message_parts):
+                try:
+                    # Add continuation indicator for multi-part messages
+                    if len(message_parts) > 1:
+                        part = f"📄 Часть {i + 1}/{len(message_parts)}\n\n{part}"
+
+                    # Try sending with HTML formatting
+                    await message.reply(part, parse_mode=ParseMode.HTML)
+                except Exception as e:
+                    logger.error(f"HTML parsing error in part {i + 1}: {e}")
+                    # Fallback to plain text if HTML fails
+                    clean_text = re.sub(r'<[^>]*>', '', part)
+                    await message.reply(clean_text)
+        else:
+            await message.reply("❌ Не удалось получить ответ от AI-сервисов. Попробуйте позже.")
+    except Exception as e:
+        logger.error(f"Ошибка в AI-проверке здоровья: {e}")
+        await message.reply("❌ Произошла ошибка при выполнении AI-проверки здоровья")
+
+
 async def send_admin_notification(text: str):
     """Отправить уведомление администратору"""
     if bot and TELEGRAM_ADMIN_ID:
@@ -2159,104 +2844,6 @@ async def process_notifications():
             logger.error(f"Ошибка обработки уведомлений: {e}")
             await asyncio.sleep(5)
 
-async def send_admin_notification(text: str):
-    """Отправить уведомление администратору"""
-    if bot and TELEGRAM_ADMIN_ID:
-        try:
-            await bot.send_message(TELEGRAM_ADMIN_ID, text)
-            logger.info("Уведомление отправлено администратору")
-        except Exception as e:
-            logger.error(f"Ошибка отправки уведомления: {e}")
-
-
-def get_device_energy_stats_cloud(device_id: str, start_time: datetime, end_time: datetime) -> Dict:
-    """Получает статистику энергопотребления устройства через Tuya Cloud API"""
-    logger.debug(f"Запрос статистики энергопотребления для устройства {device_id}")
-
-    # Проверяем кэш
-    cache_key = f"energy_stats_{device_id}_{start_time.strftime('%Y%m%d')}_{end_time.strftime('%Y%m%d')}"
-    cached_data = data_cache.get(cache_key)
-    if cached_data:
-        logger.debug(f"Используются кэшированные данные статистики для устройства {device_id}")
-        return cached_data
-
-    @rate_limit
-    def _make_request():
-        try:
-            # Используем правильный метод API - getdevicelog
-            # Проверяем документацию tinytuya для правильной сигнатуры
-            start_ms = int(start_time.timestamp() * 1000)
-            end_ms = int(end_time.timestamp() * 1000)
-
-            # Пробуем разные варианты вызова getdevicelog
-            try:
-                # Вариант 1: device_id как первый аргумент
-                response = tuya_cloud.getdevicelog(
-                    device_id,  # Первый аргумент - device_id
-                    start=start_ms,
-                    end=end_ms,
-                    type="7"  # type=7 для отчетов о данных
-                )
-            except Exception:
-                # Вариант 2: передача device_id как именованного аргумента
-                response = tuya_cloud.getdevicelog(
-                    id=device_id,
-                    start=start_ms,
-                    end=end_ms,
-                    type="7"
-                )
-
-            logger.debug(f"Ответ статистики для устройства {device_id}: {response}")
-            return response
-        except Exception as e:
-            logger.error(f"Ошибка запроса статистики устройства {device_id}: {e}")
-            return None
-
-    try:
-        response = _make_request()
-        if response and response.get('success'):
-            result = response.get('result', [])
-            energy_wh = 0
-
-            # Анализируем логи для извлечения данных о потреблении
-            for log_entry in result:
-                # Проверяем формат записи
-                if not isinstance(log_entry, dict):
-                    continue
-
-                # Ищем записи с данными о мощности (DPS 20) и общем потреблении (DPS 17)
-                if 'dps' in log_entry and isinstance(log_entry['dps'], dict):
-                    dps = log_entry['dps']
-
-                    # Если есть данные о общем потреблении энергии (DPS 17)
-                    if '17' in dps:
-                        try:
-                            energy_wh += float(dps['17'])  # DPS 17 обычно в ватт-часах
-                        except (ValueError, TypeError):
-                            continue
-
-            energy_kwh = energy_wh / 1000  # Преобразование в кВт·ч
-            stats_data = {
-                'device_id': device_id,
-                'energy_kwh': energy_kwh,
-                'start_time': start_time.isoformat(),
-                'end_time': end_time.isoformat(),
-                'success': True,
-                'raw_logs': len(result)
-            }
-
-            # Сохраняем в кэш
-            data_cache.set(cache_key, stats_data)
-            return stats_data
-        else:
-            # Если основной метод не сработал, используем альтернативный
-            logger.warning(
-                f"Основной метод получения статистики не сработал для устройства {device_id}, используем альтернативный")
-            return get_device_energy_stats_cloud_alternative(device_id, start_time, end_time)
-    except Exception as e:
-        logger.error(f"Ошибка при получении статистики устройства {device_id}: {e}")
-        # В случае ошибки используем альтернативный метод
-        return get_device_energy_stats_cloud_alternative(device_id, start_time, end_time)
 
 def queue_notification(text: str):
     """Добавляет уведомление в очередь с обработкой ошибки отсутствия event loop"""
@@ -2286,6 +2873,7 @@ def queue_notification(text: str):
             clean_text = text.encode('ascii', 'ignore').decode('ascii')
             logger.error(f"Ошибка добавления уведомления в очередь: {e}")
 
+
 def safe_log(message: str, level: str = "info"):
     """Безопасное логирование с поддержкой эмодзи"""
     try:
@@ -2313,6 +2901,7 @@ def safe_log(message: str, level: str = "info"):
 def monitor_devices():
     """Основная функция мониторинга устройств"""
     global device_states, last_counters, monitoring_active
+
     safe_log("Запуск мониторинга устройств (облачный режим)...")
 
     # Инициализация состояний
@@ -2331,6 +2920,7 @@ def monitor_devices():
             "last_counter": counter,
             "session_start": datetime.now() if is_on else None
         }
+
         last_counters[device_id] = counter
 
         safe_log(f"Устройство {device_name} инициализировано: состояние={'ВКЛ' if is_on else 'ВЫКЛ'}, "
@@ -2386,7 +2976,6 @@ def monitor_devices():
                         if state["session_start"]:
                             end_time = datetime.now()
                             energy_kwh = counter - state["last_counter"]
-
                             safe_log(f"{device_name} выключился в {end_time}")
                             safe_log(f"Сессия: энергия={energy_kwh:.3f} кВт·ч, "
                                      f"длительность={end_time - state['session_start']}")
@@ -2507,6 +3096,7 @@ def test_tuya_api_methods():
         logger.info(f"Результат варианта 3: {response}")
     except Exception as e:
         logger.error(f"Ошибка варианта 3: {e}")
+
 
 async def main():
     """Основная асинхронная функция"""
