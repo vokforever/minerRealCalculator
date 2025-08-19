@@ -1,0 +1,62 @@
+{
+  "pavlenko": {
+    "tariff_type": "day_night",
+    "ranges": [
+      {
+        "min_kwh": 0,
+        "max_kwh": 150,
+        "day_rate": 4.82,
+        "night_rate": 3.39
+      },
+      {
+        "min_kwh": 150,
+        "max_kwh": 800,
+        "day_rate": 6.11,
+        "night_rate": 4.28
+      },
+      {
+        "min_kwh": 800,
+        "max_kwh": null,
+        "day_rate": 8.13,
+        "night_rate": 5.69
+      }
+    ],
+    "description": "Тарифы для локации Павленко с дневным/ночным разделением"
+  },
+  "sevastopolskaya": {
+    "tariff_type": "day_night",
+    "ranges": [
+      {
+        "min_kwh": 0,
+        "max_kwh": 150,
+        "day_rate": 4.82,
+        "night_rate": 3.39
+      },
+      {
+        "min_kwh": 150,
+        "max_kwh": 800,
+        "day_rate": 6.11,
+        "night_rate": 4.28
+      },
+      {
+        "min_kwh": 800,
+        "max_kwh": null,
+        "day_rate": 8.13,
+        "night_rate": 5.69
+      }
+    ],
+    "description": "Тарифы для локации Севастопольская с дневным/ночным разделением"
+  },
+  "default": {
+    "tariff_type": "single",
+    "ranges": [
+      {
+        "min_kwh": 0,
+        "max_kwh": null,
+        "day_rate": 5.47,
+        "night_rate": 5.47
+      }
+    ],
+    "description": "Стандартный тариф без разделения на зоны"
+  }
+}
