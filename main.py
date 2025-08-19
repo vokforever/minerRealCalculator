@@ -41,7 +41,6 @@ TUYA_API_REGION = os.getenv("TUYA_API_REGION", "eu")
 # Supabase настройки
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-DEVICES_CONFIG_PATH = os.getenv("DEVICES_CONFIG_PATH")
 TARIFF_SETTINGS_PATH = os.getenv("TARIFF_SETTINGS_PATH", "tariff_settings.json")
 
 # Telegram Bot настройки
@@ -60,7 +59,7 @@ CEREBRAS_API_KEY = os.getenv("CEREBRAS_API_KEY")
 CEREBRAS_MODEL = os.getenv("CEREBRAS_MODEL", "qwen-3-235b-a22b-thinking-2507")
 
 # Проверка переменных
-required_vars = [TUYA_ACCESS_ID, TUYA_ACCESS_SECRET, SUPABASE_URL, SUPABASE_KEY, DEVICES_CONFIG_PATH]
+required_vars = [TUYA_ACCESS_ID, TUYA_ACCESS_SECRET, SUPABASE_URL, SUPABASE_KEY]
 if not all(required_vars):
     raise ValueError("Проверьте .env файл: все переменные должны быть заданы!")
 
@@ -68,8 +67,8 @@ if not TELEGRAM_BOT_TOKEN:
     logger.warning("TELEGRAM_BOT_TOKEN не задан, функция бота будет отключена")
 
 if not OPENROUTER_API_KEY and not CEREBRAS_API_KEY:
-    logger.warning \
-        ("Не заданы ключи для AI-сервисов (OPENROUTER_API_KEY или CEREBRAS_API_KEY), AI-функции будут отключены")
+    logger.warning(
+        "Не заданы ключи для AI-сервисов (OPENROUTER_API_KEY или CEREBRAS_API_KEY), AI-функции будут отключены")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -77,13 +76,102 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 cg = CoinGeckoAPI()
 
 # Загрузка конфигурации устройств
+def load_devices_from_database():
+    """Загружает конфигурацию устройств из базы данных Supabase"""
+    try:
+        response = supabase.table('miner_devices_config').select('*').eq('is_active', True).execute()
+        if response.data:
+            devices = response.data
+            logger.info(f"Загружена конфигурация для {len(devices)} устройств из базы данных")
+            return devices
+        else:
+            logger.warning("Не найдено активных устройств в базе данных")
+            return []
+    except Exception as e:
+        logger.error(f"Ошибка загрузки конфигурации устройств из базы данных: {e}")
+        # Fallback к пустому списку устройств
+        return []
+
+def add_device_to_database(device_id: str, name: str, location: str) -> bool:
+    """Добавляет новое устройство в базу данных"""
+    try:
+        response = supabase.table('miner_devices_config').insert({
+            'device_id': device_id,
+            'name': name,
+            'location': location,
+            'is_active': True
+        }).execute()
+        
+        if response.data:
+            logger.info(f"Устройство {name} ({device_id}) успешно добавлено в базу данных")
+            return True
+        else:
+            logger.error(f"Не удалось добавить устройство {name} в базу данных")
+            return False
+    except Exception as e:
+        logger.error(f"Ошибка при добавлении устройства {name}: {e}")
+        return False
+
+def update_device_in_database(device_id: str, name: str = None, location: str = None, is_active: bool = None) -> bool:
+    """Обновляет существующее устройство в базе данных"""
+    try:
+        update_data = {}
+        if name is not None:
+            update_data['name'] = name
+        if location is not None:
+            update_data['location'] = location
+        if is_active is not None:
+            update_data['is_active'] = is_active
+            
+        if not update_data:
+            logger.warning("Нет данных для обновления устройства")
+            return False
+            
+        response = supabase.table('miner_devices_config').update(update_data).eq('device_id', device_id).execute()
+        
+        if response.data:
+            logger.info(f"Устройство {device_id} успешно обновлено в базе данных")
+            return True
+        else:
+            logger.error(f"Не удалось обновить устройство {device_id} в базе данных")
+            return False
+    except Exception as e:
+        logger.error(f"Ошибка при обновлении устройства {device_id}: {e}")
+        return False
+
+def delete_device_from_database(device_id: str) -> bool:
+    """Удаляет устройство из базы данных (устанавливает is_active = False)"""
+    try:
+        response = supabase.table('miner_devices_config').update({'is_active': False}).eq('device_id', device_id).execute()
+        
+        if response.data:
+            logger.info(f"Устройство {device_id} успешно деактивировано в базе данных")
+            return True
+        else:
+            logger.error(f"Не удалось деактивировать устройство {device_id} в базе данных")
+            return False
+    except Exception as e:
+        logger.error(f"Ошибка при деактивации устройства {device_id}: {e}")
+        return False
+
+def refresh_devices_from_database():
+    """Обновляет список устройств из базы данных"""
+    global DEVICES
+    try:
+        DEVICES = load_devices_from_database()
+        logger.info(f"Список устройств обновлен: {len(DEVICES)} активных устройств")
+        return True
+    except Exception as e:
+        logger.error(f"Ошибка при обновлении списка устройств: {e}")
+        return False
+
 try:
-    with open(DEVICES_CONFIG_PATH, "r", encoding="utf-8") as f:
-        DEVICES = json.load(f)
-    logger.info(f"Загружена конфигурация для {len(DEVICES)} устройств")
+    DEVICES = load_devices_from_database()
+    if not DEVICES:
+        logger.warning("Конфигурация устройств пуста, некоторые функции могут работать некорректно")
 except Exception as e:
-    logger.error(f"Ошибка загрузки конфигурации устройств: {e}")
-    raise
+    logger.error(f"Критическая ошибка загрузки конфигурации устройств: {e}")
+    DEVICES = []  # Устанавливаем пустой список как fallback
 
 # Загрузка тарифных настроек
 try:
@@ -222,7 +310,6 @@ class APIRateLimiter:
             if len(self.request_timestamps) >= self.max_requests_per_second:
                 logger.warning(f"Достигнут лимит запросов в секунду: {len(self.request_timestamps)}")
                 return False
-
             return True
 
     def record_request(self):
@@ -326,7 +413,6 @@ def get_device_status_cloud_enhanced(device_id: str) -> Tuple[bool, float, Optio
                             status['result'].extend(enhanced_status.get('result', []))
                 except Exception as e:
                     logger.debug(f"Не удалось получить расширенный DPS: {e}")
-
             return status
         except Exception as e:
             logger.error(f"Ошибка запроса статуса устройства {device_id}: {e}")
@@ -417,7 +503,6 @@ def get_device_status_cloud_enhanced(device_id: str) -> Tuple[bool, float, Optio
 
         logger.info(f"Устройство {device_id}: состояние={'ВКЛ' if is_on else 'ВЫКЛ'}, "
                     f"счетчик={counter:.3f} кВт·ч, мощность={cur_power} Вт")
-
         return result_data
     else:
         logger.error(f"Ошибка получения статуса устройства {device_id}: {status}")
@@ -508,7 +593,6 @@ def get_device_energy_stats_cloud(device_id: str, start_time: datetime, end_time
 
             # Сохраняем в кэш
             data_cache.set(cache_key, stats_data)
-
             return stats_data
         else:
             # Если основной метод не сработал, используем альтернативный
@@ -557,7 +641,6 @@ def get_device_energy_stats_cloud_alternative(device_id: str, start_time: dateti
 
         # Сохраняем в кэш
         data_cache.set(cache_key, stats_data)
-
         return stats_data
     except Exception as e:
         logger.error(f"Ошибка альтернативного запроса статистики устройства {device_id}: {e}")
@@ -586,10 +669,8 @@ def get_daily_energy_consumption(device_id: str, date: datetime = None) -> Dict:
     """Получить дневное потребление электроэнергии"""
     if date is None:
         date = datetime.now().date()
-
     start_date = datetime.combine(date, datetime.min.time())
     end_date = start_date + timedelta(days=1)
-
     return get_device_energy_stats_cloud(device_id, start_date, end_date)
 
 
@@ -599,13 +680,11 @@ def get_monthly_energy_consumption(device_id: str, year: int = None, month: int 
         year = datetime.now().year
     if month is None:
         month = datetime.now().month
-
     start_date = datetime(year, month, 1)
     if month == 12:
         end_date = datetime(year + 1, 1, 1)
     else:
         end_date = datetime(year, month + 1, 1)
-
     return get_device_energy_stats_cloud(device_id, start_date, end_date)
 
 
@@ -639,7 +718,6 @@ def get_historical_consumption_pattern(device_id: str, days: int = 7) -> Dict:
 
             # Получаем статистику за день с использованием альтернативного метода при необходимости
             daily_stats = get_device_energy_stats_cloud(device_id, day_start, day_end)
-
             if daily_stats['success']:
                 daily_consumption = daily_stats['energy_kwh']
 
@@ -796,7 +874,6 @@ def predict_consumption_based_on_sales(device_id: str, location: str, days: int 
 def get_current_power_consumption() -> Dict[str, Dict]:
     """Получает текущее потребление мощности всех устройств"""
     logger.info("Запрос текущего потребления мощности")
-
     consumption_data = {}
 
     for device in DEVICES:
@@ -838,7 +915,6 @@ def get_month_consumption_from_api(location: str) -> float:
 
     for device in location_devices:
         device_id = device["device_id"]
-
         # Пробуем получить данные через Cloud API
         monthly_data = get_monthly_energy_consumption(device_id)
         if monthly_data['success']:
@@ -860,8 +936,7 @@ def get_today_consumption_from_api(location: str) -> float:
 
     for device in location_devices:
         device_id = device["device_id"]
-
-        # Пробуем получить данные через Cloud API
+        # Пробуем получить данные через API
         daily_data = get_daily_energy_consumption(device_id)
         if daily_data['success']:
             total_consumption += daily_data['energy_kwh']
@@ -943,7 +1018,6 @@ def get_tariff_ranges(location: str, use_fallback: bool = False) -> List[Dict]:
                     {"min_kwh": 150, "max_kwh": 800, "day_rate": 6.11, "night_rate": 4.28},
                     {"min_kwh": 800, "max_kwh": None, "day_rate": 8.13, "night_rate": 5.69}
                 ]
-
         return TARIFF_SETTINGS[location]["ranges"]
     except Exception as e:
         logger.error(f"Ошибка получения тарифов для {location}: {e}", exc_info=True)
@@ -960,8 +1034,8 @@ def split_session_by_zones(start_time: datetime, end_time: datetime) -> Tuple[fl
 
     day_hours = 0.0
     night_hours = 0.0
-
     current_time = start_time
+
     while current_time < end_time:
         next_hour = current_time.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
         if next_hour > end_time:
@@ -1016,7 +1090,6 @@ def calculate_session_cost_with_ranges(
     remaining_night_energy = night_energy
     remaining_total_energy = energy_kwh
     current_monthly_kwh = previous_monthly_kwh
-
     cost_details = {
         "ranges": [],
         "tariff_type": tariff_type
@@ -1047,7 +1120,6 @@ def calculate_session_cost_with_ranges(
                     range_cost = energy_in_range * range_data["day_rate"]
 
                 total_cost += range_cost
-
                 cost_details["ranges"].append({
                     "range_name": range_data.get("name", f"{range_min}-{range_max}"),
                     "energy_kwh": energy_in_range,
@@ -1091,7 +1163,6 @@ def calculate_session_cost(
         location_devices = [d for d in DEVICES if d["location"] == location and d["device_id"] == device_id]
         if location_devices:
             previous_monthly_kwh = 0
-
             # Получаем потребление за месяц до начала сессии
             monthly_data = get_monthly_energy_consumption(device_id, month_start.year, month_start.month)
             if monthly_data['success']:
@@ -1103,7 +1174,6 @@ def calculate_session_cost(
                     "miner_device_id", device_id).gte(
                     "session_start_time", month_start.isoformat()).lt(
                     "session_start_time", start_time.isoformat()).execute()
-
                 previous_monthly_kwh = sum(session["energy_kwh"] for session in response.data)
                 use_fallback = previous_monthly_kwh == 0  # Используем запасной тариф если нет данных
 
@@ -1156,10 +1226,8 @@ def save_session(
             logger.warning(f"Could not include cost_details: {e}")
 
         response = supabase.table("miner_energy_sessions").insert(session_data).execute()
-
         logger.info(
             f"Сессия успешно сохранена: {device_id}, энергия: {energy_kwh:.3f} кВт·ч, стоимость: {cost_rub:.2f} руб.")
-
         return response.data[0] if response.data else None
     except Exception as e:
         logger.error(f"Ошибка сохранения сессии: {e}", exc_info=True)
@@ -1172,7 +1240,6 @@ def get_sales_data(start_date: datetime, end_date: datetime) -> List[Dict]:
         response = supabase.table("miner_sales").select("*").gte(
             "executed_at", start_date.isoformat()).lt(
             "executed_at", end_date.isoformat()).execute()
-
         return response.data if response.data else []
     except Exception as e:
         logger.error(f"Ошибка получения данных о продажах: {e}", exc_info=True)
@@ -1185,7 +1252,6 @@ def get_energy_data(start_date: datetime, end_date: datetime) -> List[Dict]:
         response = supabase.table("miner_energy_sessions").select("*").gte(
             "session_start_time", start_date.isoformat()).lt(
             "session_start_time", end_date.isoformat()).execute()
-
         return response.data if response.data else []
     except Exception as e:
         logger.error(f"Ошибка получения данных о потреблении: {e}", exc_info=True)
@@ -1255,7 +1321,6 @@ def calculate_profitability_for_period(
 
         for session in energy_data:
             location = session["miner_location"]
-
             if location not in location_stats:
                 location_stats[location] = {
                     "total_energy": 0.0,
@@ -1270,7 +1335,6 @@ def calculate_profitability_for_period(
             location_stats[location]["day_energy"] += session["day_energy_kwh"]
             location_stats[location]["night_energy"] += session["night_energy_kwh"]
             location_stats[location]["devices"].add(session["miner_device_id"])
-
             total_cost += session["cost_rub"]
 
         # Рассчитываем чистую прибыль и рентабельность
@@ -1321,7 +1385,6 @@ def calculate_profitability_for_period(
                 "sales_count": len(sales_data),
                 "energy_sessions_count": len(energy_data)
             }
-
             supabase.table("miner_profitability_history").insert(profit_data).execute()
         except Exception as e:
             logger.error(f"Ошибка сохранения данных о доходности: {e}")
@@ -1336,7 +1399,6 @@ def calculate_daily_profitability(date: datetime = None):
     """Рассчитывает дневную доходность майнинга на основе реальных продаж"""
     if date is None:
         date = datetime.now().date()
-
     logger.info(f"Расчет дневной доходности за {date}")
 
     try:
@@ -1358,7 +1420,6 @@ def calculate_daily_profitability(date: datetime = None):
                 "sales_count": profitability_data["sales_count"],
                 "energy_sessions_count": profitability_data["energy_sessions_count"]
             }
-
             supabase.table("miner_daily_profitability").upsert(
                 daily_profit_data,
                 on_conflict="calculation_date"
@@ -1380,7 +1441,6 @@ def calculate_weekly_profitability(end_date: datetime = None):
     """Рассчитывает недельную доходность и среднесуточные показатели"""
     if end_date is None:
         end_date = datetime.now()
-
     start_date = end_date - timedelta(days=7)
     logger.info(f"Расчет недельной доходности: {start_date} - {end_date}")
 
@@ -1424,7 +1484,6 @@ def calculate_weekly_profitability(end_date: datetime = None):
                 # Сначала проверяем, существует ли уже запись за эту неделю
                 existing_record = supabase.table("miner_weekly_profitability").select("*").eq(
                     "start_date", start_date.isoformat()).execute()
-
                 if existing_record.data:
                     # Если запись существует, обновляем ее
                     supabase.table("miner_weekly_profitability").update(
@@ -1445,7 +1504,6 @@ def calculate_weekly_profitability(end_date: datetime = None):
             logger.info(f"  Общая прибыль: {weekly_data['net_profit']:.2f} RUB")
             logger.info(f"  Рентабельность: {weekly_data['profitability_percentage']:.2f}%")
             logger.info(f"  Среднесуточная прибыль: {weekly_data['avg_daily_profit']:.2f} RUB")
-
             return weekly_data, avg_daily_profitability
     except Exception as e:
         logger.error(f"Ошибка расчета недельной доходности: {e}", exc_info=True)
@@ -1456,7 +1514,6 @@ def calculate_monthly_profitability(end_date: datetime = None):
     """Рассчитывает месячную доходность"""
     if end_date is None:
         end_date = datetime.now()
-
     start_date = end_date - timedelta(days=30)
     logger.info(f"Расчет месячной доходности: {start_date} - {end_date}")
 
@@ -1480,7 +1537,6 @@ def calculate_monthly_profitability(end_date: datetime = None):
                 "sales_count": monthly_data["sales_count"],
                 "energy_sessions_count": monthly_data["energy_sessions_count"]
             }
-
             supabase.table("miner_monthly_profitability").upsert(
                 monthly_profit_data,
                 on_conflict="start_date"
@@ -1493,7 +1549,6 @@ def calculate_monthly_profitability(end_date: datetime = None):
             logger.info(f"  Общая прибыль: {monthly_data['net_profit']:.2f} RUB")
             logger.info(f"  Рентабельность: {monthly_data['profitability_percentage']:.2f}%")
             logger.info(f"  Среднесуточная прибыль: {monthly_data['avg_daily_profit']:.2f} RUB")
-
             return monthly_data
     except Exception as e:
         logger.error(f"Ошибка расчета месячной доходности: {e}", exc_info=True)
@@ -1504,7 +1559,6 @@ def calculate_3day_profitability(end_date: datetime = None):
     """Рассчитывает доходность за последние 3 дня"""
     if end_date is None:
         end_date = datetime.now()
-
     start_date = end_date - timedelta(days=3)
     logger.info(f"Расчет 3-дневной доходности: {start_date} - {end_date}")
 
@@ -1549,7 +1603,6 @@ def calculate_3day_profitability(end_date: datetime = None):
                     profit_data,
                     on_conflict="start_date"
                 ).execute()
-
                 if response.data:
                     logger.info(f"3-дневная доходность успешно сохранена")
                 else:
@@ -1570,7 +1623,6 @@ def calculate_3day_profitability(end_date: datetime = None):
             logger.info(f"  Общая прибыль: {data_3d['net_profit']:.2f} RUB")
             logger.info(f"  Рентабельность: {data_3d['profitability_percentage']:.2f}%")
             logger.info(f"  Среднесуточная прибыль: {data_3d['avg_daily_profit']:.2f} RUB")
-
             return data_3d, avg_daily_profitability
         else:
             logger.error("Не удалось рассчитать 3-дневную доходность: пустые данные")
@@ -1608,7 +1660,6 @@ def get_today_spending() -> Dict[str, Dict]:
             response = supabase.table("miner_energy_sessions").select("*").gte(
                 "session_start_time", start_date.isoformat()).lt(
                 "session_start_time", end_date.isoformat()).execute()
-
             sessions = response.data
         else:
             sessions = []
@@ -1774,6 +1825,420 @@ def format_profitability_forecast_message(forecast_data: Dict) -> str:
     return message
 
 
+# Function to sanitize AI responses for Telegram
+def sanitize_for_telegram_html(text):
+    """Sanitize AI response to prevent Telegram parsing errors"""
+    if not text:
+        return ""
+
+    # First, clean reasoning tags
+    text = parse_ai_thinking_tags(text)
+
+    # Remove problematic HTML tags that might cause parsing issues
+    # Keep only basic formatting tags that Telegram supports
+    allowed_tags = ['b', 'i', 'u', 's', 'a', 'code', 'pre']
+
+    # Pattern to match HTML tags
+    tag_pattern = re.compile(r'</?([a-zA-Z0-9]+)(?:\s+[^>]*)?>')
+
+    def replace_tag(match):
+        tag_name = match.group(1).lower()
+        if tag_name in allowed_tags:
+            return match.group(0)  # Keep allowed tags
+        return ""  # Remove disallowed tags
+
+    # Replace disallowed tags
+    sanitized = tag_pattern.sub(replace_tag, text)
+
+    # Fix common HTML issues
+    sanitized = sanitized.replace("&nbsp;", " ")  # Replace non-breaking spaces
+    sanitized = sanitized.replace("&amp;", "&")  # Fix ampersands
+    sanitized = sanitized.replace("&lt;", "<")  # Fix less than
+    sanitized = sanitized.replace("&gt;", ">")  # Fix greater than
+
+    # Remove any remaining HTML entities that might cause issues
+    sanitized = re.sub(r'&[a-zA-Z0-9#]+;', '', sanitized)
+
+    # Final validation: ensure all opened tags are closed
+    tag_stack = []
+    for match in re.finditer(r'<([a-zA-Z0-9]+)(?:\s+[^>]*)?>', sanitized):
+        tag = match.group(1)
+        if tag in allowed_tags:
+            tag_stack.append(tag)
+
+    # Close any unclosed tags
+    for tag in reversed(tag_stack):
+        if tag not in ['img', 'br', 'hr']:  # Self-closing tags
+            sanitized += f"</{tag}>"
+
+    return sanitized
+
+
+# Function to split long messages for Telegram
+def split_message_for_telegram(text, max_length=4096):
+    """Split a long message into multiple parts for Telegram"""
+    if len(text) <= max_length:
+        return [text]
+
+    parts = []
+    current_part = ""
+
+    # Split by paragraphs first
+    paragraphs = text.split('\n\n')
+
+    for paragraph in paragraphs:
+        # If adding this paragraph would exceed the limit, start a new part
+        if len(current_part) + len(paragraph) + 2 > max_length:
+            if current_part:  # Save current part if not empty
+                parts.append(current_part)
+                current_part = ""
+
+            # If a single paragraph is too long, split it by lines
+            if len(paragraph) > max_length:
+                lines = paragraph.split('\n')
+                for line in lines:
+                    if len(current_part) + len(line) + 1 > max_length:
+                        if current_part:
+                            parts.append(current_part)
+                            current_part = line
+                        else:
+                            # If a single line is too long, split it by words
+                            words = line.split(' ')
+                            for word in words:
+                                if len(current_part) + len(word) + 1 > max_length:
+                                    if current_part:
+                                        parts.append(current_part)
+                                        current_part = word
+                                    else:
+                                        # If a single word is too long, split it
+                                        while len(word) > max_length:
+                                            parts.append(word[:max_length])
+                                            word = word[max_length:]
+                                        current_part = word
+                                else:
+                                    if current_part:
+                                        current_part += " " + word
+                                    else:
+                                        current_part = word
+                    else:
+                        if current_part:
+                            current_part += "\n" + line
+                        else:
+                            current_part = line
+            else:
+                current_part = paragraph
+        else:
+            if current_part:
+                current_part += "\n\n" + paragraph
+            else:
+                current_part = paragraph
+
+    # Add the last part if not empty
+    if current_part:
+        parts.append(current_part)
+
+    return parts
+
+
+# Function to parse AI thinking tags
+def parse_ai_thinking_tags(response_text: str) -> str:
+    """
+    Enhanced function to remove reasoning content from AI responses.
+    Supports all major tag formats from different providers.
+    """
+    if not response_text:
+        return ""
+
+    # Compile all patterns for optimization
+    patterns = [
+        # Cerebras and DeepSeek formats
+        (r'', re.DOTALL),
+        (r'<thinking>.*?</thinking>', re.DOTALL),
+        (r'<answer>.*?</answer>', re.DOTALL),
+        # OpenRouter and other formats
+        (r'<details>.*?</details>', re.DOTALL),
+        (r'<div[^>]*class=["\'][^"\']*thinking[^"\']*["\'][^>]*>.*?</div>', re.DOTALL),
+        # Handle incomplete/damaged tags
+        (r'<thinking>.*?$', re.DOTALL),  # Unclosed thinking tag
+        (r'<details>.*?$', re.DOTALL),  # Unclosed details tag
+        (r'<div[^>]*class=["\'][^"\']*thinking[^"\']*["\'][^>]*>.*?$', re.DOTALL),  # Unclosed thinking div
+        # Handle nested tags
+        (r'<thinking>.*?<thinking>.*?</thinking>.*?</thinking>', re.DOTALL),
+        (r'<details>.*?<details>.*?</details>.*?</details>', re.DOTALL),
+    ]
+
+    cleaned_text = response_text
+
+    # Apply each pattern to remove thinking sections
+    for pattern, flags in patterns:
+        try:
+            think_pattern = re.compile(pattern, flags)
+            cleaned_text = think_pattern.sub('', cleaned_text)
+        except Exception as e:
+            logger.warning(f"Error applying pattern {pattern}: {e}")
+
+    # Clean up extra whitespace and newlines
+    cleaned_text = re.sub(r'\n\s*\n', '\n\n', cleaned_text.strip())
+
+    # Remove any remaining HTML entities that might cause issues
+    cleaned_text = re.sub(r'&[a-zA-Z0-9#]+;', '', cleaned_text)
+
+    # Final validation: ensure no broken HTML remains
+    if '<' in cleaned_text and '>' in cleaned_text:
+        # Additional safety check for malformed HTML
+        html_tags = re.findall(r'<[^>]+>', cleaned_text)
+        allowed_tags = ['b', 'i', 'u', 's', 'a', 'code', 'pre']
+        for tag in html_tags:
+            tag_name = re.findall(r'^</?([a-zA-Z0-9]+)', tag)
+            if tag_name and tag_name[0].lower() not in allowed_tags:
+                # Remove disallowed tag
+                cleaned_text = cleaned_text.replace(tag, '')
+
+    return cleaned_text.strip()
+
+
+# Function to execute AI requests with proper error handling
+async def make_ai_request(system_prompt, user_prompt, temperature=0.7, max_tokens=1500):
+    """Execute AI request with proper rate limiting handling and enhanced thinking tag parsing"""
+    # Try OpenRouter first
+    if openai_client:
+        try:
+            response = openai_client.chat.completions.create(
+                model=REASONING_MODEL,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=temperature,
+                max_tokens=max_tokens,
+                extra_headers={
+                    "HTTP-Referer": OPENROUTER_SITE_URL,
+                    "X-Title": OPENROUTER_SITE_NAME,
+                },
+                timeout=10  # Add timeout to prevent hanging
+            )
+            # Enhanced parsing of thinking tags from the response
+            raw_response = response.choices[0].message.content
+            logger.debug(f"Raw AI response: {raw_response[:200]}...")
+
+            # Apply enhanced cleaning
+            cleaned_response = parse_ai_thinking_tags(raw_response)
+            logger.debug(f"Cleaned AI response: {cleaned_response[:200]}...")
+
+            return cleaned_response, "OpenRouter"
+        except Exception as e:
+            error_msg = str(e)
+            logger.warning(f"OpenRouter request failed: {error_msg}")
+            # Check for rate limiting errors
+            if "429" in error_msg or "rate limit" in error_msg.lower():
+                logger.info("Rate limit exceeded on OpenRouter, switching to Cerebras")
+            # Continue to Cerebras below
+    # Fallback to Cerebras
+    if cerebras_client:
+        try:
+            response = cerebras_client.chat.completions.create(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                model=CEREBRAS_MODEL,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                timeout=10  # Add timeout
+            )
+            # Enhanced parsing of thinking tags from the response
+            raw_response = response.choices[0].message.content
+            logger.debug(f"Raw AI response: {raw_response[:200]}...")
+
+            # Apply enhanced cleaning
+            cleaned_response = parse_ai_thinking_tags(raw_response)
+            logger.debug(f"Cleaned AI response: {cleaned_response[:200]}...")
+
+            return cleaned_response, "Cerebras"
+        except Exception as e:
+            logger.warning(f"Cerebras request failed: {e}")
+    # Both providers failed
+    return None, None
+
+
+# Chat session management
+class ChatSession:
+    """Manage chat sessions with history"""
+
+    def __init__(self):
+        self.sessions = {}  # user_id: {'history': [], 'context': {}}
+        self.max_history = 10  # Maximum messages to keep in history
+        self.auto_clear_after = 3600  # Auto-clear after 1 hour (in seconds)
+
+    def get_session(self, user_id: int):
+        """Get or create user session"""
+        if user_id not in self.sessions:
+            self.sessions[user_id] = {
+                'history': [],
+                'context': {},
+                'last_activity': datetime.now()
+            }
+        return self.sessions[user_id]
+
+    def add_message(self, user_id: int, role: str, content: str):
+        """Add message to session history"""
+        session = self.get_session(user_id)
+        session['history'].append({
+            'role': role,
+            'content': content,
+            'timestamp': datetime.now()
+        })
+        session['last_activity'] = datetime.now()
+
+        # Keep only recent messages
+        if len(session['history']) > self.max_history:
+            session['history'] = session['history'][-self.max_history:]
+
+    def clear_session(self, user_id: int):
+        """Clear user session"""
+        if user_id in self.sessions:
+            del self.sessions[user_id]
+
+    def auto_clear_inactive(self):
+        """Clear inactive sessions"""
+        current_time = datetime.now()
+        inactive_users = [
+            user_id for user_id, session in self.sessions.items()
+            if (current_time - session['last_activity']).total_seconds() > self.auto_clear_after
+        ]
+        for user_id in inactive_users:
+            self.clear_session(user_id)
+
+
+# Global chat session manager
+chat_sessions = ChatSession()
+
+
+# Natural Language to SQL converter
+class NaturalLanguageToSQL:
+    """Convert natural language queries to SQL"""
+
+    def __init__(self):
+        self.table_schemas = {
+            'miner_energy_sessions': {
+                'columns': ['id', 'miner_device_id', 'miner_location', 'session_start_time',
+                            'session_end_time', 'energy_kwh', 'cost_rub', 'tariff_type',
+                            'day_energy_kwh', 'night_energy_kwh', 'created_at'],
+                'description': 'Сессии потребления электроэнергии для майнинговых устройств'
+            },
+            'miner_sales': {
+                'columns': ['id', 'order_id', 'currency_bought', 'amount_sold',
+                            'total_received', 'avg_price', 'executed_at', 'created_at'],
+                'description': 'Записи о продажах от майнинговой деятельности'
+            },
+            'miner_daily_profitability': {
+                'columns': ['id', 'calculation_date', 'total_income_rub', 'total_cost_rub',
+                            'net_profit_rub', 'profitability_percentage', 'sales_count',
+                            'energy_sessions_count', 'created_at'],
+                'description': 'Расчеты дневной доходности'
+            }
+        }
+
+    async def generate_sql_query(self, question: str, context: dict = None) -> dict:
+        """
+        Convert natural language question to SQL query
+        Args:
+            question: Natural language question
+            context: Additional context from previous messages
+        Returns:
+            Dictionary with sql_query, explanation, and parameters
+        """
+        # Create prompt for AI
+        schema_info = "\n".join([
+            f"Таблица: {table}\nКолонки: {', '.join(schema['columns'])}\nОписание: {schema['description']}"
+            for table, schema in self.table_schemas.items()
+        ])
+
+        prompt = f"""
+        Преобразуй следующий вопрос на естественном языке в SQL-запрос на основе схемы базы данных:
+        Схема базы данных:
+        {schema_info}
+        Вопрос: {question}
+        Контекст: {context or 'Нет'}
+        Правила:
+        1. Используй правильный синтаксис SQL для PostgreSQL (Supabase)
+        2. Всегда используй параметризованные запросы для предотвращения SQL-инъекций
+        3. Включи правильную фильтрацию по датам при запросах о временных периодах
+        4. Используй соответствующие агрегатные функции (SUM, AVG, COUNT) при необходимости
+        5. Возвращай только SQL-запрос без каких-либо объяснений
+        Верни ответ в формате JSON:
+        {{
+            "sql_query": "SELECT ...",
+            "explanation": "Краткое объяснение того, что делает запрос",
+            "parameters": []
+        }}
+        """
+
+        # Get AI response
+        ai_response, _ = await make_ai_request(
+            system_prompt="Ты - эксперт по разработке SQL. Преобразовывай вопросы на естественном языке в SQL-запросы.",
+            user_prompt=prompt,
+            temperature=0.1,
+            max_tokens=1000
+        )
+
+        if ai_response:
+            try:
+                # Parse JSON response
+                result = json.loads(ai_response)
+                return result
+            except json.JSONDecodeError:
+                # Fallback: try to extract SQL from text
+                sql_match = re.search(r'SELECT.*?(?=;|$)', ai_response, re.IGNORECASE | re.DOTALL)
+                if sql_match:
+                    return {
+                        'sql_query': sql_match.group(0),
+                        'explanation': 'Сгенерированный SQL-запрос',
+                        'parameters': []
+                    }
+        return None
+
+    async def execute_query(self, sql_query: str, parameters: list = None) -> list:
+        """Execute SQL query against Supabase"""
+        try:
+            # Note: This is a simplified implementation. In production, you should
+            # use proper SQL execution through Supabase's RPC or direct SQL
+            response = supabase.rpc('exec_sql', {'query': sql_query, 'params': parameters or []}).execute()
+            return response.data if response.data else []
+        except Exception as e:
+            logger.error(f"Ошибка выполнения SQL: {e}")
+            # Return empty list instead of None to avoid further errors
+            return []
+
+
+# Global NL-to-SQL converter
+nl_to_sql = NaturalLanguageToSQL()
+
+
+# Setup bot commands
+async def setup_bot_commands():
+    """Setup bot command menu"""
+    commands = [
+        types.BotCommand(command="start", description="Запустить бота"),
+        types.BotCommand(command="help", description="Показать справку"),
+        types.BotCommand(command="today", description="Статистика за сегодня и прогноз"),
+        types.BotCommand(command="last", description="Доходность за последние 3 дня"),
+        types.BotCommand(command="profit24h", description="24-часовая доходность"),
+        types.BotCommand(command="profit7d", description="Недельная доходность"),
+        types.BotCommand(command="profit30d", description="Месячная доходность"),
+        types.BotCommand(command="profitall", description="Доходность за все периоды"),
+        types.BotCommand(command="devices", description="Статус устройств"),
+        types.BotCommand(command="api_status", description="Статус API"),
+        types.BotCommand(command="ai_analyze", description="AI-анализ ситуации"),
+        types.BotCommand(command="ai_forecast", description="AI-прогноз потребления"),
+        types.BotCommand(command="ai_optimize", description="AI-оптимизация доходности"),
+        types.BotCommand(command="ai_health", description="AI-проверка системы"),
+        types.BotCommand(command="clear", description="Очистить историю чата"),
+        types.BotCommand(command="chat", description="Общение с AI-помощником")
+    ]
+    await bot.set_my_commands(commands)
+
+
 # Telegram Bot Handlers
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
@@ -1794,6 +2259,8 @@ async def cmd_start(message: types.Message):
         "/ai_forecast - AI-прогноз энергопотребления\n"
         "/ai_optimize - AI-оптимизация доходности\n"
         "/ai_health - AI-проверка здоровья системы\n"
+        "/chat - Начать диалог с AI-помощником\n"
+        "/clear - Очистить историю чата\n"
         "/help - Помощь"
     )
 
@@ -1810,11 +2277,17 @@ async def cmd_help(message: types.Message):
 /profit30d - Показать месячную доходность и среднесуточные показатели
 /profitall - Показать сводную доходность за все периоды (24ч, 7д, 30д)
 /devices - Показать текущий статус всех устройств
+/list_devices - Показать список всех устройств в базе данных
+/add_device - Добавить новое устройство (только для админа)
+/update_device - Обновить устройство (только для админа)
+/delete_device - Удалить устройство (только для админа)
 /api_status - Показать статус использования Tuya AI
 /ai_analyze - AI-анализ текущей ситуации майнинга
 /ai_forecast [период] - AI-прогноз энергопотребления (24h, 7d, 30d)
 /ai_optimize - AI-оптимизация доходности майнинга
 /ai_health - AI-проверка здоровья системы
+/chat - Начать диалог с AI-помощником на естественном языке
+/clear - Очистить историю чата с AI-помощником
 /help - Показать эту справку
 
 📊 <b>Формат вывода:</b>
@@ -1844,7 +2317,12 @@ async def cmd_help(message: types.Message):
 • Прогнозирование энергопотребления на основе исторических данных
 • Оптимизация доходности с учетом тарифов и эффективности
 • Обнаружение аномалий и проблем в системе
-"""
+
+💬 <b>Диалог с AI:</b>
+• Задавайте вопросы на естественном русском языке
+• Примеры: "расходы на электричество за 7 дней", "сколько мы заработали за месяц"
+• AI преобразует ваши вопросы в SQL-запросы и вернет ответы
+    """
     await message.reply(help_text, parse_mode=ParseMode.HTML)
 
 
@@ -1852,7 +2330,6 @@ async def cmd_help(message: types.Message):
 async def cmd_api_status(message: types.Message):
     """Обработчик команды /api_status"""
     logger.info(f"Пользователь {message.from_user.id} запросил статус AI")
-
     status = api_limiter.get_status()
     cache_size = len(data_cache.cache)
     rate_info = ExchangeRateManager.get_rate_info()
@@ -1873,7 +2350,6 @@ async def cmd_api_status(message: types.Message):
 
     if status['requests_today'] > status['daily_limit'] * 0.8:
         status_text += "\n⚠️ <b>Внимание!</b> Вы приближаетесь к дневному лимиту AI!\n"
-
     if status['requests_per_second'] > status['second_limit'] * 0.8:
         status_text += "⚠️ <b>Внимание!</b> Высокая нагрузка на AI!\n"
 
@@ -2257,10 +2733,8 @@ async def cmd_devices(message: types.Message):
                 if is_on:
                     total_power += power
                     active_devices += 1
-
             if 'cur_voltage' in device_data:
                 response_text += f"Напряжение: {device_data['cur_voltage']:.1f} В\n"
-
             if 'cur_current' in device_data:
                 response_text += f"Ток: {device_data['cur_current']:.2f} А\n"
 
@@ -2279,154 +2753,142 @@ async def cmd_devices(message: types.Message):
     await message.reply(response_text, parse_mode=ParseMode.HTML)
 
 
-# Function to sanitize AI responses for Telegram
-def sanitize_for_telegram_html(text):
-    """Sanitize AI response to prevent Telegram parsing errors"""
-    if not text:
-        return ""
-
-    # Remove problematic HTML tags that might cause parsing issues
-    # Keep only basic formatting tags that Telegram supports
-    allowed_tags = ['b', 'i', 'u', 's', 'a', 'code', 'pre']
-
-    # Pattern to match HTML tags
-    tag_pattern = re.compile(r'</?([a-zA-Z0-9]+)(?:\s+[^>]*)?>')
-
-    def replace_tag(match):
-        tag_name = match.group(1).lower()
-        if tag_name in allowed_tags:
-            return match.group(0)  # Keep allowed tags
-        return ""  # Remove disallowed tags
-
-    # Replace disallowed tags
-    sanitized = tag_pattern.sub(replace_tag, text)
-
-    # Fix common HTML issues
-    sanitized = sanitized.replace("&nbsp;", " ")  # Replace non-breaking spaces
-    sanitized = sanitized.replace("&amp;", "&")  # Fix ampersands
-    sanitized = sanitized.replace("&lt;", "<")  # Fix less than
-    sanitized = sanitized.replace("&gt;", ">")  # Fix greater than
-
-    # Remove any remaining HTML entities that might cause issues
-    sanitized = re.sub(r'&[a-zA-Z0-9#]+;', '', sanitized)
-
-    return sanitized
-
-
-# Function to split long messages for Telegram
-def split_message_for_telegram(text, max_length=4096):
-    """Split a long message into multiple parts for Telegram"""
-    if len(text) <= max_length:
-        return [text]
-
-    parts = []
-    current_part = ""
-
-    # Split by paragraphs first
-    paragraphs = text.split('\n\n')
-
-    for paragraph in paragraphs:
-        # If adding this paragraph would exceed the limit, start a new part
-        if len(current_part) + len(paragraph) + 2 > max_length:
-            if current_part:  # Save current part if not empty
-                parts.append(current_part)
-                current_part = ""
-
-            # If a single paragraph is too long, split it by lines
-            if len(paragraph) > max_length:
-                lines = paragraph.split('\n')
-                for line in lines:
-                    if len(current_part) + len(line) + 1 > max_length:
-                        if current_part:
-                            parts.append(current_part)
-                            current_part = line
-                        else:
-                            # If a single line is too long, split it by words
-                            words = line.split(' ')
-                            for word in words:
-                                if len(current_part) + len(word) + 1 > max_length:
-                                    if current_part:
-                                        parts.append(current_part)
-                                        current_part = word
-                                    else:
-                                        # If a single word is too long, split it
-                                        while len(word) > max_length:
-                                            parts.append(word[:max_length])
-                                            word = word[max_length:]
-                                        current_part = word
-                                else:
-                                    if current_part:
-                                        current_part += " " + word
-                                    else:
-                                        current_part = word
-                    else:
-                        if current_part:
-                            current_part += "\n" + line
-                        else:
-                            current_part = line
-            else:
-                current_part = paragraph
-        else:
-            if current_part:
-                current_part += "\n\n" + paragraph
-            else:
-                current_part = paragraph
-
-    # Add the last part if not empty
-    if current_part:
-        parts.append(current_part)
-
-    return parts
+@dp.message(Command("add_device"))
+async def cmd_add_device(message: types.Message):
+    """Обработчик команды /add_device для добавления нового устройства"""
+    logger.info(f"Пользователь {message.from_user.id} запросил добавление устройства")
+    
+    # Проверяем права администратора
+    if str(message.from_user.id) != TELEGRAM_ADMIN_ID:
+        await message.reply("❌ У вас нет прав для выполнения этой команды.")
+        return
+    
+    # Парсим аргументы команды: /add_device device_id name location
+    args = message.text.split()[1:]
+    if len(args) < 3:
+        await message.reply(
+            "❌ Неправильный формат команды.\n"
+            "Используйте: /add_device <device_id> <название> <локация>\n"
+            "Пример: /add_device bf1234567890abcdef \"Мой риг\" pavlenko"
+        )
+        return
+    
+    device_id = args[0]
+    name = args[1]
+    location = args[2]
+    
+    # Добавляем устройство в базу данных
+    if add_device_to_database(device_id, name, location):
+        # Обновляем список устройств
+        refresh_devices_from_database()
+        await message.reply(
+            f"✅ Устройство успешно добавлено!\n"
+            f"ID: {device_id}\n"
+            f"Название: {name}\n"
+            f"Локация: {location}"
+        )
+    else:
+        await message.reply("❌ Ошибка при добавлении устройства. Проверьте логи.")
 
 
-# Function to execute AI requests with proper error handling
-async def make_ai_request(system_prompt, user_prompt, temperature=0.7, max_tokens=1500):
-    """Execute AI request with proper rate limiting handling"""
-    # Try OpenRouter first
-    if openai_client:
-        try:
-            response = openai_client.chat.completions.create(
-                model=REASONING_MODEL,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                temperature=temperature,
-                max_tokens=max_tokens,
-                extra_headers={
-                    "HTTP-Referer": OPENROUTER_SITE_URL,
-                    "X-Title": OPENROUTER_SITE_NAME,
-                },
-                timeout=10  # Add timeout to prevent hanging
-            )
-            return response.choices[0].message.content, "OpenRouter"
-        except Exception as e:
-            error_msg = str(e)
-            logger.warning(f"OpenRouter request failed: {error_msg}")
-            # Check for rate limiting errors
-            if "429" in error_msg or "rate limit" in error_msg.lower():
-                logger.info("Rate limit exceeded on OpenRouter, switching to Cerebras")
-            # Continue to Cerebras below
+@dp.message(Command("update_device"))
+async def cmd_update_device(message: types.Message):
+    """Обработчик команды /update_device для обновления устройства"""
+    logger.info(f"Пользователь {message.from_user.id} запросил обновление устройства")
+    
+    # Проверяем права администратора
+    if str(message.from_user.id) != TELEGRAM_ADMIN_ID:
+        await message.reply("❌ У вас нет прав для выполнения этой команды.")
+        return
+    
+    # Парсим аргументы команды: /update_device device_id [name] [location] [active]
+    args = message.text.split()[1:]
+    if len(args) < 2:
+        await message.reply(
+            "❌ Неправильный формат команды.\n"
+            "Используйте: /update_device <device_id> [название] [локация] [active]\n"
+            "Пример: /update_device bf1234567890abcdef \"Новое название\" pavlenko true"
+        )
+        return
+    
+    device_id = args[0]
+    name = args[1] if len(args) > 1 and args[1] != "null" else None
+    location = args[2] if len(args) > 2 and args[2] != "null" else None
+    is_active = args[3].lower() == "true" if len(args) > 3 else None
+    
+    # Обновляем устройство в базе данных
+    if update_device_in_database(device_id, name, location, is_active):
+        # Обновляем список устройств
+        refresh_devices_from_database()
+        await message.reply(
+            f"✅ Устройство {device_id} успешно обновлено!\n"
+            f"Обновленные поля: {[k for k, v in [('name', name), ('location', location), ('is_active', is_active)] if v is not None]}"
+        )
+    else:
+        await message.reply("❌ Ошибка при обновлении устройства. Проверьте логи.")
 
-    # Fallback to Cerebras
-    if cerebras_client:
-        try:
-            response = cerebras_client.chat.completions.create(
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                model=CEREBRAS_MODEL,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                timeout=10  # Add timeout
-            )
-            return response.choices[0].message.content, "Cerebras"
-        except Exception as e:
-            logger.warning(f"Cerebras request failed: {e}")
 
-    # Both providers failed
-    return None, None
+@dp.message(Command("delete_device"))
+async def cmd_delete_device(message: types.Message):
+    """Обработчик команды /delete_device для удаления устройства"""
+    logger.info(f"Пользователь {message.from_user.id} запросил удаление устройства")
+    
+    # Проверяем права администратора
+    if str(message.from_user.id) != TELEGRAM_ADMIN_ID:
+        await message.reply("❌ У вас нет прав для выполнения этой команды.")
+        return
+    
+    # Парсим аргументы команды: /delete_device device_id
+    args = message.text.split()[1:]
+    if len(args) < 1:
+        await message.reply(
+            "❌ Неправильный формат команды.\n"
+            "Используйте: /delete_device <device_id>\n"
+            "Пример: /delete_device bf1234567890abcdef"
+        )
+        return
+    
+    device_id = args[0]
+    
+    # Удаляем устройство из базы данных (деактивируем)
+    if delete_device_from_database(device_id):
+        # Обновляем список устройств
+        refresh_devices_from_database()
+        await message.reply(f"✅ Устройство {device_id} успешно деактивировано!")
+    else:
+        await message.reply("❌ Ошибка при удалении устройства. Проверьте логи.")
+
+
+@dp.message(Command("list_devices"))
+async def cmd_list_devices(message: types.Message):
+    """Обработчик команды /list_devices для просмотра всех устройств"""
+    logger.info(f"Пользователь {message.from_user.id} запросил список устройств")
+    
+    try:
+        # Получаем все устройства из базы данных (включая неактивные)
+        response = supabase.table('miner_devices_config').select('*').execute()
+        
+        if not response.data:
+            await message.reply("📋 Устройства не найдены в базе данных.")
+            return
+        
+        devices = response.data
+        response_text = "📋 <b>Список всех устройств:</b>\n\n"
+        
+        for device in devices:
+            status_emoji = "🟢" if device.get('is_active', True) else "🔴"
+            response_text += f"{status_emoji} <b>{device['name']}</b>\n"
+            response_text += f"ID: {device['device_id']}\n"
+            response_text += f"Локация: {device['location']}\n"
+            response_text += f"Статус: {'Активно' if device.get('is_active', True) else 'Неактивно'}\n"
+            response_text += f"Создано: {device.get('created_at', 'N/A')}\n"
+            response_text += f"Обновлено: {device.get('updated_at', 'N/A')}\n\n"
+        
+        await message.reply(response_text, parse_mode=ParseMode.HTML)
+        
+    except Exception as e:
+        logger.error(f"Ошибка при получении списка устройств: {e}")
+        await message.reply("❌ Ошибка при получении списка устройств. Проверьте логи.")
 
 
 # AI-команды
@@ -2502,7 +2964,6 @@ async def cmd_ai_analyze(message: types.Message):
                     # Add continuation indicator for multi-part messages
                     if len(message_parts) > 1:
                         part = f"📄 Часть {i + 1}/{len(message_parts)}\n\n{part}"
-
                     # Try sending with HTML formatting
                     await message.reply(part, parse_mode=ParseMode.HTML)
                 except Exception as e:
@@ -2565,7 +3026,6 @@ async def cmd_ai_forecast(message: types.Message):
         - Сезонные колебания
         - Исторические тренды
         - Эффективность устройств
-
         Предоставь прогноз на русском языке, включающий:
         1. Прогноз общего потребления на период {period}
         2. Ожидаемое распределение по часам
@@ -2605,7 +3065,6 @@ async def cmd_ai_forecast(message: types.Message):
                     # Add continuation indicator for multi-part messages
                     if len(message_parts) > 1:
                         part = f"📄 Часть {i + 1}/{len(message_parts)}\n\n{part}"
-
                     # Try sending with HTML formatting
                     await message.reply(part, parse_mode=ParseMode.HTML)
                 except Exception as e:
@@ -2654,7 +3113,6 @@ async def cmd_ai_optimize(message: types.Message):
         - Общие затраты: {profitability_data.get('total_cost', 0):.2f} RUB
         - Чистая прибыль: {profitability_data.get('net_profit', 0):.2f} RUB
         - Рентабельность: {profitability_data.get('profitability_percentage', 0):.2f}%
-
         Тарифы по локациям:
         """
 
@@ -2708,7 +3166,6 @@ async def cmd_ai_optimize(message: types.Message):
                     # Add continuation indicator for multi-part messages
                     if len(message_parts) > 1:
                         part = f"📄 Часть {i + 1}/{len(message_parts)}\n\n{part}"
-
                     # Try sending with HTML formatting
                     await message.reply(part, parse_mode=ParseMode.HTML)
                 except Exception as e:
@@ -2773,7 +3230,6 @@ async def cmd_ai_health(message: types.Message):
         - Устройства с отклонениями напряжения
         - Резкие изменения в показаниях счетчиков
         - Неработающие устройства
-
         Предоставь анализ здоровья системы на русском языке, включающий:
         1. Общую оценку состояния системы
         2. Выявленные аномалии или проблемы
@@ -2807,7 +3263,6 @@ async def cmd_ai_health(message: types.Message):
                     # Add continuation indicator for multi-part messages
                     if len(message_parts) > 1:
                         part = f"📄 Часть {i + 1}/{len(message_parts)}\n\n{part}"
-
                     # Try sending with HTML formatting
                     await message.reply(part, parse_mode=ParseMode.HTML)
                 except Exception as e:
@@ -2820,6 +3275,102 @@ async def cmd_ai_health(message: types.Message):
     except Exception as e:
         logger.error(f"Ошибка в AI-проверке здоровья: {e}")
         await message.reply("❌ Произошла ошибка при выполнении AI-проверки здоровья")
+
+
+# Chat commands
+@dp.message(Command("chat"))
+async def cmd_chat(message: types.Message):
+    """Start a chat session with AI assistant"""
+    chat_sessions.clear_session(message.from_user.id)
+    await message.reply(
+        "🤖 <b>Режим AI-помощника</b>\n\n"
+        "Теперь вы можете задавать мне вопросы о вашей майнинг-ферме на естественном русском языке. "
+        "Я могу помочь вам со следующей информацией:\n"
+        "• Статистика потребления электроэнергии\n"
+        "• Анализ доходности\n"
+        "• Информация о статусе устройств\n"
+        "• Данные о продажах\n\n"
+        "Просто напишите ваш вопрос или используйте /clear для сброса диалога.",
+        parse_mode=ParseMode.HTML
+    )
+
+
+@dp.message(Command("clear"))
+async def cmd_clear(message: types.Message):
+    """Clear chat history"""
+    chat_sessions.clear_session(message.from_user.id)
+    await message.reply("🗑️ История чата очищена. Начните диалог с ваших вопросов!")
+
+
+@dp.message()
+async def handle_natural_chat(message: types.Message):
+    """Handle natural language chat messages"""
+    # Skip commands
+    if message.text.startswith('/'):
+        return
+
+    user_id = message.from_user.id
+    question = message.text
+
+    # Add user message to history
+    chat_sessions.add_message(user_id, 'user', question)
+
+    # Get session context
+    session = chat_sessions.get_session(user_id)
+    context = session['context']
+
+    # Generate SQL query (now with await)
+    sql_result = await nl_to_sql.generate_sql_query(question, context)
+
+    if sql_result:
+        # Execute query
+        query_result = await nl_to_sql.execute_query(sql_result['sql_query'], sql_result['parameters'])
+
+        # Create response prompt for AI
+        response_prompt = f"""
+        Пользователь спросил: {question}
+        Выполненный SQL-запрос: {sql_result['sql_query']}
+        Объяснение запроса: {sql_result['explanation']}
+        Результаты запроса: {json.dumps(query_result, indent=2, default=str, ensure_ascii=False)}
+        Пожалуйста, предоставь ответ пользователю на естественном русском языке на основе этих результатов.
+        Будь полезен, лаконичен и включай релевантные цифры и инсайты.
+        """
+
+        # Get AI response
+        ai_response, provider = await make_ai_request(
+            system_prompt="Ты - полезный помощник по майнинг-ферме. Предоставляй четкие, краткие ответы на основе предоставленных данных.",
+            user_prompt=response_prompt,
+            temperature=0.5,
+            max_tokens=1000
+        )
+
+        if ai_response:
+            # Add AI response to history
+            chat_sessions.add_message(user_id, 'assistant', ai_response)
+
+            # Send response (handle long messages)
+            response_text = f"🤖 <b>AI-помощник</b> (via {provider})\n\n{ai_response}"
+            message_parts = split_message_for_telegram(response_text)
+
+            # Send each part
+            for i, part in enumerate(message_parts):
+                try:
+                    # Add continuation indicator for multi-part messages
+                    if len(message_parts) > 1:
+                        part_with_indicator = f"📄 Часть {i + 1}/{len(message_parts)}\n\n{part}"
+                    else:
+                        part_with_indicator = part
+                    # Try sending with HTML formatting
+                    await message.reply(part_with_indicator, parse_mode=ParseMode.HTML)
+                except Exception as e:
+                    logger.error(f"Error sending message part: {e}")
+                    clean_text = re.sub(r'<[^>]*>', '', part)
+                    await message.reply(clean_text)
+        else:
+            await message.reply(
+                "❌ Извините, я не смог обработать ваш вопрос. Пожалуйста, попробуйте переформулировать.")
+    else:
+        await message.reply("❌ Я не понял ваш вопрос. Пожалуйста, попробуйте задать его по-другому.")
 
 
 async def send_admin_notification(text: str):
@@ -2901,7 +3452,6 @@ def safe_log(message: str, level: str = "info"):
 def monitor_devices():
     """Основная функция мониторинга устройств"""
     global device_states, last_counters, monitoring_active
-
     safe_log("Запуск мониторинга устройств (облачный режим)...")
 
     # Инициализация состояний
@@ -2920,7 +3470,6 @@ def monitor_devices():
             "last_counter": counter,
             "session_start": datetime.now() if is_on else None
         }
-
         last_counters[device_id] = counter
 
         safe_log(f"Устройство {device_name} инициализировано: состояние={'ВКЛ' if is_on else 'ВЫКЛ'}, "
@@ -2976,6 +3525,7 @@ def monitor_devices():
                         if state["session_start"]:
                             end_time = datetime.now()
                             energy_kwh = counter - state["last_counter"]
+
                             safe_log(f"{device_name} выключился в {end_time}")
                             safe_log(f"Сессия: энергия={energy_kwh:.3f} кВт·ч, "
                                      f"длительность={end_time - state['session_start']}")
@@ -3098,8 +3648,25 @@ def test_tuya_api_methods():
         logger.error(f"Ошибка варианта 3: {e}")
 
 
+async def session_cleanup_task():
+    """Background task to clean up inactive chat sessions"""
+    while True:
+        try:
+            chat_sessions.auto_clear_inactive()
+            await asyncio.sleep(300)  # Check every 5 minutes
+        except Exception as e:
+            logger.error(f"Error in session cleanup: {e}")
+            await asyncio.sleep(60)
+
+
 async def main():
     """Основная асинхронная функция"""
+    # Setup bot commands
+    await setup_bot_commands()
+
+    # Start background tasks
+    cleanup_task = asyncio.create_task(session_cleanup_task())
+
     # Запускаем обработчик уведомлений
     notification_task = asyncio.create_task(process_notifications())
 

@@ -6,3 +6,5 @@ pycoingecko
 numpy
 openai
 cerebras_cloud_sdk
+schedule
+psutil

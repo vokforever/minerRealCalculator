@@ -7,6 +7,9 @@ snapshot.json
 notes.md
 tinytuya.json
 
+# Ignore SQL files (database scripts)
+*.sql
+
 # Ignore virtual environment
 .venv/
 
