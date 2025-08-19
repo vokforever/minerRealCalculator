@@ -1124,6 +1124,66 @@ def get_today_consumption_from_api(location: str) -> float:
     return total_consumption
 
 
+def get_72h_consumption_from_api(location: str) -> Dict[str, float]:
+    """Получить потребление за последние 72 часа через Tuya API"""
+    total_consumption = 0
+    total_cost = 0
+    day_energy = 0
+    night_energy = 0
+    
+    # Получаем устройства для локации
+    location_devices = [d for d in DEVICES if d["location"] == location]
+    
+    # Получаем тарифы для локации
+    location_tariff = TARIFF_SETTINGS.get(location, {})
+    tariff_type = location_tariff.get("tariff_type", "single")
+    ranges = location_tariff.get("ranges", [{}])[0] if location_tariff.get("ranges") else {}
+    
+    for device in location_devices:
+        device_id = device["device_id"]
+        
+        # Получаем данные за последние 72 часа
+        end_time = datetime.now()
+        start_time = end_time - timedelta(hours=72)
+        
+        # Пробуем получить данные через API
+        device_stats = get_device_energy_stats_cloud(device_id, start_time, end_time)
+        
+        if device_stats['success']:
+            device_consumption = device_stats['energy_kwh']
+            total_consumption += device_consumption
+            
+            # Рассчитываем стоимость
+            if tariff_type == "day_night":
+                # Примерное распределение день/ночь (67% день, 33% ночь)
+                device_day_energy = device_consumption * 0.67
+                device_night_energy = device_consumption * 0.33
+                device_cost = (
+                    device_day_energy * ranges.get("day_rate", 4.82) +
+                    device_night_energy * ranges.get("night_rate", 3.39)
+                )
+                day_energy += device_day_energy
+                night_energy += device_night_energy
+            else:
+                device_cost = device_consumption * ranges.get("day_rate", 4.82)
+                day_energy += device_consumption
+                night_energy += 0
+            
+            total_cost += device_cost
+            
+            logger.debug(f"Устройство {device_id}: потребление за 72ч {device_consumption:.3f} кВт·ч, стоимость {device_cost:.2f} RUB")
+        else:
+            logger.warning(
+                f"Не удалось получить данные за 72ч для устройства {device_id}: {device_stats.get('error', 'Unknown error')}")
+    
+    return {
+        "total_energy": total_consumption,
+        "total_cost": total_cost,
+        "day_energy": day_energy,
+        "night_energy": night_energy
+    }
+
+
 def estimate_profitability(current_power_w: float, location: str, device_id: str = None, days: int = 1) -> Dict[
     str, float]:
     """Рассчитывает прогнозную доходность на основе текущей мощности и исторических данных"""
@@ -2410,7 +2470,9 @@ async def setup_bot_commands():
         types.BotCommand(command="ai_optimize", description="AI-оптимизация доходности"),
         types.BotCommand(command="ai_health", description="AI-проверка системы"),
         types.BotCommand(command="clear", description="Очистить историю чата"),
-        types.BotCommand(command="chat", description="Общение с AI-помощником")
+        types.BotCommand(command="chat", description="Общение с AI-помощником"),
+        types.BotCommand(command="electricity_today", description="Реальное потребление электроэнергии за сегодня"),
+        types.BotCommand(command="electricity_72h", description="Реальное потребление электроэнергии за 72 часа")
     ]
     await bot.set_my_commands(commands)
 
@@ -3478,6 +3540,215 @@ async def cmd_clear(message: types.Message):
     await message.reply("🗑️ История чата очищена. Начните диалог с ваших вопросов!")
 
 
+@dp.message(Command("electricity_today"))
+async def cmd_electricity_today(message: types.Message):
+    """Обработчик команды /electricity_today - показывает реальное потребление электроэнергии за сегодня"""
+    logger.info(f"Пользователь {message.from_user.id} запросил реальное потребление электроэнергии за сегодня")
+    
+    try:
+        # Получаем реальные данные о потреблении за сегодня
+        today_stats = get_today_spending()
+        
+        if not today_stats:
+            await message.reply("📊 За сегодня еще нет данных о потреблении электроэнергии.")
+            return
+        
+        response_text = f"⚡ <b>Реальное потребление электроэнергии за сегодня ({datetime.now().strftime('%d.%m.%Y')}):</b>\n\n"
+        
+        total_energy = 0
+        total_cost = 0
+        
+        for location, stats in today_stats.items():
+            energy = stats.get("total_energy", 0)
+            cost = stats.get("total_cost", 0)
+            day_energy = stats.get("day_energy", 0)
+            night_energy = stats.get("night_energy", 0)
+            source = stats.get("source", "Unknown")
+            
+            total_energy += energy
+            total_cost += cost
+            
+            source_emoji = "📡" if source == "API" else "💾"
+            response_text += f"📍 <b>{location}:</b> {source_emoji} {source}\n"
+            response_text += f"   🔋 Общее потребление: {energy:.3f} кВт·ч\n"
+            response_text += f"   💰 Стоимость: {cost:.2f} RUB\n"
+            response_text += f"   ☀️ Дневной тариф: {day_energy:.3f} кВт·ч\n"
+            response_text += f"   🌙 Ночной тариф: {night_energy:.3f} кВт·ч\n\n"
+            
+            # Добавляем информацию об устройствах если есть
+            if stats.get("devices"):
+                response_text += "   🖥️ Устройства:\n"
+                for device_id, device_info in stats["devices"].items():
+                    device_name = device_info.get("name", "Unknown")
+                    device_energy = device_info.get("energy", 0)
+                    device_cost = device_info.get("cost", 0)
+                    response_text += f"      • {device_name}: {device_energy:.3f} кВт·ч ({device_cost:.2f} RUB)\n"
+                response_text += "\n"
+        
+        # Добавляем общую статистику
+        response_text += f"📊 <b>Общая статистика:</b>\n"
+        response_text += f"   🔋 Общее потребление: {total_energy:.3f} кВт·ч\n"
+        response_text += f"   💰 Общая стоимость: {total_cost:.2f} RUB\n"
+        
+        # Рассчитываем среднюю стоимость за кВт·ч
+        if total_energy > 0:
+            avg_cost_per_kwh = total_cost / total_energy
+            response_text += f"   💸 Средняя стоимость: {avg_cost_per_kwh:.2f} RUB/кВт·ч\n"
+        
+        await message.reply(response_text, parse_mode=ParseMode.HTML)
+        
+    except Exception as e:
+        logger.error(f"Ошибка получения данных о потреблении за сегодня: {e}")
+        await message.reply("❌ Произошла ошибка при получении данных о потреблении электроэнергии.")
+
+
+@dp.message(Command("electricity_72h"))
+async def cmd_electricity_72h(message: types.Message):
+    """Обработчик команды /electricity_72h - показывает реальное потребление электроэнергии за последние 72 часа"""
+    logger.info(f"Пользователь {message.from_user.id} запросил реальное потребление электроэнергии за 72 часа")
+    
+    try:
+        # Рассчитываем период за последние 72 часа
+        end_date = datetime.now()
+        start_date = end_date - timedelta(hours=72)
+        
+        # Сначала пробуем получить данные через API
+        api_stats = {}
+        for location in set(device["location"] for device in DEVICES):
+            api_consumption = get_72h_consumption_from_api(location)
+            if api_consumption['total_energy'] > 0:
+                api_stats[location] = api_consumption
+        
+        # Если API не дал данных, используем базу данных
+        if not api_stats:
+            energy_data = get_energy_data(start_date, end_date)
+            if not energy_data:
+                await message.reply("📊 За последние 72 часа нет данных о потреблении электроэнергии.")
+                return
+        else:
+            energy_data = []
+        
+        response_text = f"⚡ <b>Реальное потребление электроэнергии за 72 часа ({start_date.strftime('%d.%m %H:%M')} - {end_date.strftime('%d.%m %H:%M')}):</b>\n\n"
+        
+        # Группируем данные по локациям
+        location_stats = {}
+        total_energy = 0
+        total_cost = 0
+        
+        # Обрабатываем данные из API
+        for location, stats in api_stats.items():
+            location_stats[location] = {
+                "total_energy": stats["total_energy"],
+                "total_cost": stats["total_cost"],
+                "day_energy": stats["day_energy"],
+                "night_energy": stats["night_energy"],
+                "sessions_count": 1,  # API данные - одна сессия
+                "devices": set(),
+                "sessions": [],
+                "source": "API"
+            }
+            total_energy += stats["total_energy"]
+            total_cost += stats["total_cost"]
+        
+        # Обрабатываем данные из базы (если есть)
+        for session in energy_data:
+            location = session.get("miner_location", "Unknown")
+            device_id = session.get("miner_device_id", "Unknown")
+            energy = session.get("energy_kwh", 0)
+            cost = session.get("cost_rub", 0)
+            day_energy = session.get("day_energy_kwh", 0)
+            night_energy = session.get("night_energy_kwh", 0)
+            start_time = session.get("session_start_time")
+            end_time = session.get("session_end_time")
+            
+            if location not in location_stats:
+                location_stats[location] = {
+                    "total_energy": 0,
+                    "total_cost": 0,
+                    "day_energy": 0,
+                    "night_energy": 0,
+                    "sessions_count": 0,
+                    "devices": set(),
+                    "sessions": []
+                }
+            
+            location_stats[location]["total_energy"] += energy
+            location_stats[location]["total_cost"] += cost
+            location_stats[location]["day_energy"] += day_energy
+            location_stats[location]["night_energy"] += night_energy
+            location_stats[location]["sessions_count"] += 1
+            location_stats[location]["devices"].add(device_id)
+            location_stats[location]["sessions"].append({
+                "device_id": device_id,
+                "energy": energy,
+                "cost": cost,
+                "start_time": start_time,
+                "end_time": end_time
+            })
+            
+            total_energy += energy
+            total_cost += cost
+        
+        # Формируем ответ по локациям
+        for location, stats in location_stats.items():
+            source = stats.get("source", "Unknown")
+            source_emoji = "📡" if source == "API" else "💾"
+            
+            response_text += f"📍 <b>{location}:</b> {source_emoji} {source}\n"
+            response_text += f"   🔋 Общее потребление: {stats['total_energy']:.3f} кВт·ч\n"
+            response_text += f"   💰 Стоимость: {stats['total_cost']:.2f} RUB\n"
+            response_text += f"   ☀️ Дневной тариф: {stats['day_energy']:.3f} кВт·ч\n"
+            response_text += f"   🌙 Ночной тариф: {stats['night_energy']:.3f} кВт·ч\n"
+            response_text += f"   📊 Сессий: {stats['sessions_count']}\n"
+            response_text += f"   🖥️ Устройств: {len(stats['devices'])}\n\n"
+            
+            # Добавляем детали по сессиям (первые 3)
+            if stats["sessions"]:
+                response_text += "   📅 Последние сессии:\n"
+                for i, session in enumerate(stats["sessions"][:3]):
+                    device_id = session["device_id"]
+                    energy = session["energy"]
+                    cost = session["cost"]
+                    start_time = session["start_time"]
+                    end_time = session["end_time"]
+                    
+                    # Форматируем время
+                    if start_time and end_time:
+                        try:
+                            start_dt = datetime.fromisoformat(start_time.replace('Z', '+00:00'))
+                            end_dt = datetime.fromisoformat(end_time.replace('Z', '+00:00'))
+                            duration = end_dt - start_dt
+                            duration_hours = duration.total_seconds() / 3600
+                            time_str = f"{start_dt.strftime('%d.%m %H:%M')} - {end_dt.strftime('%H:%M')} ({duration_hours:.1f}ч)"
+                        except:
+                            time_str = f"{start_time} - {end_time}"
+                    else:
+                        time_str = "Время не указано"
+                    
+                    response_text += f"      • {device_id}: {energy:.3f} кВт·ч ({cost:.2f} RUB) - {time_str}\n"
+                response_text += "\n"
+        
+        # Добавляем общую статистику
+        response_text += f"📊 <b>Общая статистика за 72 часа:</b>\n"
+        response_text += f"   🔋 Общее потребление: {total_energy:.3f} кВт·ч\n"
+        response_text += f"   💰 Общая стоимость: {total_cost:.2f} RUB\n"
+        
+        # Рассчитываем средние показатели
+        if total_energy > 0:
+            avg_cost_per_kwh = total_cost / total_energy
+            avg_daily_energy = total_energy / 3  # 72 часа = 3 дня
+            avg_daily_cost = total_cost / 3
+            
+            response_text += f"   💸 Средняя стоимость: {avg_cost_per_kwh:.2f} RUB/кВт·ч\n"
+            response_text += f"   📅 Среднее за день: {avg_daily_energy:.3f} кВт·ч ({avg_daily_cost:.2f} RUB)\n"
+        
+        await message.reply(response_text, parse_mode=ParseMode.HTML)
+        
+    except Exception as e:
+        logger.error(f"Ошибка получения данных о потреблении за 72 часа: {e}")
+        await message.reply("❌ Произошла ошибка при получении данных о потреблении электроэнергии.")
+
+
 @dp.message()
 async def handle_natural_chat(message: types.Message):
     """Handle natural language chat messages"""
@@ -3840,45 +4111,6 @@ def monitor_devices():
             logger.error(f"Ошибка в цикле мониторинга: {e}", exc_info=True)
             time.sleep(60)  # Ждем минуту перед повторной попыткой
 
-
-def test_tuya_api_methods():
-    """Тестирование различных методов Tuya API для определения правильной сигнатуры"""
-    logger.info("Тестирование методов Tuya API...")
-
-    # Берем первое устройство для тестов
-    if not DEVICES:
-        logger.error("Нет устройств для тестирования")
-        return
-
-    device_id = DEVICES[0]["device_id"]
-
-    # Тестируем разные варианты вызова getdevicelog
-    start_ms = int((datetime.now() - timedelta(days=1)).timestamp() * 1000)
-    end_ms = int(datetime.now().timestamp() * 1000)
-
-    try:
-        # Вариант 1: device_id как первый аргумент
-        logger.info("Тестирование варианта 1: device_id как первый аргумент")
-        response = tuya_cloud.getdevicelog(device_id, start=start_ms, end=end_ms, type="7")
-        logger.info(f"Результат варианта 1: {response}")
-    except Exception as e:
-        logger.error(f"Ошибка варианта 1: {e}")
-
-    try:
-        # Вариант 2: id как именованный аргумент
-        logger.info("Тестирование варианта 2: id как именованный аргумент")
-        response = tuya_cloud.getdevicelog(id=device_id, start=start_ms, end=end_ms, type="7")
-        logger.info(f"Результат варианта 2: {response}")
-    except Exception as e:
-        logger.error(f"Ошибка варианта 2: {e}")
-
-    try:
-        # Вариант 3: device_id как именованный аргумент
-        logger.info("Тестирование варианта 3: device_id как именованный аргумент")
-        response = tuya_cloud.getdevicelog(device_id=device_id, start=start_ms, end=end_ms, type="7")
-        logger.info(f"Результат варианта 3: {response}")
-    except Exception as e:
-        logger.error(f"Ошибка варианта 3: {e}")
 
 
 async def session_cleanup_task():
