@@ -18,6 +18,7 @@ from pycoingecko import CoinGeckoAPI
 import numpy as np
 from openai import OpenAI
 from cerebras.cloud.sdk import Cerebras
+from pathlib import Path
 
 # Настройка логирования
 logging.basicConfig(
@@ -227,6 +228,181 @@ exchange_rate_cache = {
     'timestamp': None,
     'source': 'CoinGecko'
 }
+
+# Глобальные переменные для мониторинга электричества
+ELECTRICITY_DATA_FILE = "electricity_data.json"
+ELECTRICITY_HISTORY_FILE = "electricity_history.json"
+last_electricity_record = None
+last_supabase_sync = None
+
+def save_electricity_data(device_id: str, device_name: str, location: str, 
+                         power_w: float, energy_kwh: float, is_on: bool, 
+                         voltage: Optional[float] = None, current: Optional[float] = None):
+    """Сохраняет данные о потреблении электричества в JSON файл"""
+    try:
+        current_time = datetime.now()
+        
+        # Создаем директорию если её нет
+        data_dir = Path("electricity_data")
+        data_dir.mkdir(exist_ok=True)
+        
+        # Путь к файлу текущих данных
+        current_file = data_dir / ELECTRICITY_DATA_FILE
+        
+        # Загружаем существующие данные или создаем новые
+        if current_file.exists():
+            with open(current_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        else:
+            data = {
+                "last_update": current_time.isoformat(),
+                "records": [],
+                "total_records": 0
+            }
+        
+        # Создаем запись
+        record = {
+            "timestamp": current_time.isoformat(),
+            "device_id": device_id,
+            "device_name": device_name,
+            "location": location,
+            "power_w": power_w,
+            "energy_kwh": energy_kwh,
+            "is_on": is_on,
+            "voltage": voltage,
+            "current": current
+        }
+        
+        # Добавляем запись
+        data["records"].append(record)
+        data["last_update"] = current_time.isoformat()
+        data["total_records"] = len(data["records"])
+        
+        # Ограничиваем количество записей (храним последние 1000)
+        max_records = 1000
+        if len(data["records"]) > max_records:
+            data["records"] = data["records"][-max_records:]
+            data["total_records"] = len(data["records"])
+        
+        # Сохраняем в файл
+        with open(current_file, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False, default=str)
+        
+        # Добавляем в исторические данные для синхронизации
+        history_file = data_dir / ELECTRICITY_HISTORY_FILE
+        if history_file.exists():
+            with open(history_file, 'r', encoding='utf-8') as f:
+                history = json.load(f)
+        else:
+            history = {
+                "last_sync": current_time.isoformat(),
+                "pending_records": [],
+                "total_pending": 0
+            }
+        
+        history["pending_records"].append(record)
+        history["total_pending"] = len(history["pending_records"])
+        
+        with open(history_file, 'w', encoding='utf-8') as f:
+            json.dump(history, f, indent=2, ensure_ascii=False, default=str)
+        
+        logger.debug(f"Данные электричества сохранены для {device_name}")
+        
+    except Exception as e:
+        logger.error(f"Ошибка сохранения данных электричества: {e}")
+
+def sync_electricity_to_supabase():
+    """Синхронизирует данные электричества с Supabase"""
+    try:
+        data_dir = Path("electricity_data")
+        history_file = data_dir / ELECTRICITY_HISTORY_FILE
+        
+        if not history_file.exists():
+            logger.info("Файл истории электричества не найден")
+            return
+        
+        with open(history_file, 'r', encoding='utf-8') as f:
+            history = json.load(f)
+        
+        pending_records = history.get("pending_records", [])
+        
+        if not pending_records:
+            logger.info("Нет данных электричества для синхронизации")
+            return
+        
+        logger.info(f"Синхронизация {len(pending_records)} записей электричества с Supabase...")
+        
+        # Группируем записи по устройствам для создания сессий
+        device_sessions = {}
+        
+        for record in pending_records:
+            device_id = record["device_id"]
+            if device_id not in device_sessions:
+                device_sessions[device_id] = []
+            device_sessions[device_id].append(record)
+        
+        # Создаем сессии для каждого устройства
+        synced_count = 0
+        for device_id, records in device_sessions.items():
+            try:
+                # Сортируем записи по времени
+                sorted_records = sorted(records, key=lambda x: x["timestamp"])
+                
+                # Находим информацию об устройстве
+                device_info = next((d for d in DEVICES if d["device_id"] == device_id), None)
+                if not device_info:
+                    logger.warning(f"Информация об устройстве {device_id} не найдена")
+                    continue
+                
+                location = device_info["location"]
+                
+                # Создаем сессии на основе временных интервалов
+                if sorted_records:
+                    first_record = sorted_records[0]
+                    last_record = sorted_records[-1]
+                    
+                    # Рассчитываем общую энергию
+                    total_energy = sum(r["energy_kwh"] for r in sorted_records)
+                    
+                    # Создаем сессию
+                    session_data = {
+                        "miner_device_id": device_id,
+                        "miner_location": location,
+                        "session_start_time": first_record["timestamp"],
+                        "session_end_time": last_record["timestamp"],
+                        "energy_kwh": total_energy,
+                        "cost_rub": 0.0,  # Будет рассчитано позже
+                        "tariff_type": "day_night",
+                        "day_energy_kwh": 0.0,  # Будет рассчитано позже
+                        "night_energy_kwh": 0.0  # Будет рассчитано позже
+                    }
+                    
+                    # Сохраняем сессию в Supabase
+                    response = supabase.table("miner_energy_sessions").insert(session_data).execute()
+                    if response.data:
+                        synced_count += 1
+                        logger.debug(f"Сессия электричества синхронизирована: {device_id}")
+                    else:
+                        logger.warning(f"Пустой ответ при сохранении сессии электричества: {device_id}")
+                
+            except Exception as e:
+                logger.error(f"Ошибка обработки сессий электричества для устройства {device_id}: {e}")
+        
+        # Очищаем синхронизированные записи
+        if synced_count > 0:
+            history["pending_records"] = []
+            history["total_pending"] = 0
+            history["last_sync"] = datetime.now().isoformat()
+            
+            with open(history_file, 'w', encoding='utf-8') as f:
+                json.dump(history, f, indent=2, ensure_ascii=False, default=str)
+            
+            logger.info(f"Успешно синхронизировано {synced_count} сессий электричества с Supabase")
+        else:
+            logger.warning("Не удалось синхронизировать данные электричества с Supabase")
+            
+    except Exception as e:
+        logger.error(f"Ошибка синхронизации электричества с Supabase: {e}")
 
 
 class ExchangeRateManager:
@@ -3565,12 +3741,46 @@ def monitor_devices():
                         state["last_state"] = False
                         state["session_start"] = None
 
-                # Обновляем счетчик, если он изменился
-                if abs(counter - last_counters.get(device_id,
-                                                   0)) > 0.001:  # Добавляем небольшую дельту для избежания проблем с плавающей запятой
-                    logger.debug(
-                        f"Счетчик устройства {device_name} обновлен: {last_counters.get(device_id, 0)} -> {counter}")
-                    last_counters[device_id] = counter
+                            # Обновляем счетчик, если он изменился
+            if abs(counter - last_counters.get(device_id,
+                                               0)) > 0.001:  # Добавляем небольшую дельту для избежания проблем с плавающей запятой
+                logger.debug(
+                    f"Счетчик устройства {device_name} обновлен: {last_counters.get(device_id, 0)} -> {counter}")
+                last_counters[device_id] = counter
+            
+            # Записываем данные электричества каждые 5 минут
+            global last_electricity_record
+            current_time = datetime.now()
+            
+            # Проверяем, прошло ли 5 минут с последней записи
+            if (last_electricity_record is None or 
+                (current_time - last_electricity_record).total_seconds() >= 300):  # 5 минут = 300 секунд
+                
+                # Получаем данные о мощности и напряжении
+                power_w = device_data.get('cur_power', 0.0) if device_data else 0.0
+                voltage = device_data.get('cur_voltage') if device_data else None
+                current_amp = device_data.get('cur_current') if device_data else None
+                
+                # Рассчитываем потребление энергии с момента последнего измерения
+                energy_kwh = 0.0
+                if device_id in last_counters:
+                    energy_kwh = counter - last_counters[device_id]
+                    energy_kwh = max(0.0, energy_kwh)  # Только положительные значения
+                
+                # Сохраняем данные электричества
+                save_electricity_data(
+                    device_id=device_id,
+                    device_name=device_name,
+                    location=location,
+                    power_w=power_w,
+                    energy_kwh=energy_kwh,
+                    is_on=is_on,
+                    voltage=voltage,
+                    current=current_amp
+                )
+                
+                last_electricity_record = current_time
+                logger.info(f"Данные электричества записаны для {device_name} (мощность: {power_w}Вт, энергия: {energy_kwh:.3f}кВт·ч)")
 
             # Расчет дневной доходности (каждый час в начале минуты)
             current_time = datetime.now()
@@ -3596,6 +3806,29 @@ def monitor_devices():
                     calculate_monthly_profitability()
                 except Exception as e:
                     logger.error(f"Ошибка расчета месячной доходности: {e}")
+            
+            # Синхронизация электричества с Supabase 2 раза в день (6:00 и 18:00)
+            global last_supabase_sync
+            if (last_supabase_sync is None or 
+                (current_time - last_supabase_sync).total_seconds() >= 3600):  # Проверяем каждый час
+                
+                # Синхронизация в 6:00
+                if current_time.hour == 6 and current_time.minute < 5:
+                    logger.info("Запуск утренней синхронизации электричества с Supabase...")
+                    try:
+                        sync_electricity_to_supabase()
+                        last_supabase_sync = current_time
+                    except Exception as e:
+                        logger.error(f"Ошибка утренней синхронизации электричества: {e}")
+                
+                # Синхронизация в 18:00
+                elif current_time.hour == 18 and current_time.minute < 5:
+                    logger.info("Запуск вечерней синхронизации электричества с Supabase...")
+                    try:
+                        sync_electricity_to_supabase()
+                        last_supabase_sync = current_time
+                    except Exception as e:
+                        logger.error(f"Ошибка вечерней синхронизации электричества: {e}")
 
             time.sleep(30)  # Проверяем каждые 30 секунд
         except KeyboardInterrupt:

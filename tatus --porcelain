@@ -1,0 +1,142 @@
+warning: in the working copy of 'main.py', LF will be replaced by CRLF the next time Git touches it
+[1mdiff --git a/main.py b/main.py[m
+[1mindex 245b997..3190b25 100644[m
+[1m--- a/main.py[m
+[1m+++ b/main.py[m
+[36m@@ -18,6 +18,7 @@[m [mfrom pycoingecko import CoinGeckoAPI[m
+ import numpy as np[m
+ from openai import OpenAI[m
+ from cerebras.cloud.sdk import Cerebras[m
+[32m+[m[32mfrom pathlib import Path[m
+ [m
+ # Настройка логирования[m
+ logging.basicConfig([m
+[36m@@ -228,6 +229,181 @@[m [mexchange_rate_cache = {[m
+     'source': 'CoinGecko'[m
+ }[m
+ [m
+[32m+[m[32m# Глобальные переменные для мониторинга электричества[m
+[32m+[m[32mELECTRICITY_DATA_FILE = "electricity_data.json"[m
+[32m+[m[32mELECTRICITY_HISTORY_FILE = "electricity_history.json"[m
+[32m+[m[32mlast_electricity_record = None[m
+[32m+[m[32mlast_supabase_sync = None[m
+[32m+[m
+[32m+[m[32mdef save_electricity_data(device_id: str, device_name: str, location: str,[m[41m [m
+[32m+[m[32m                         power_w: float, energy_kwh: float, is_on: bool,[m[41m [m
+[32m+[m[32m                         voltage: Optional[float] = None, current: Optional[float] = None):[m
+[32m+[m[32m    """Сохраняет данные о потреблении электричества в JSON файл"""[m
+[32m+[m[32m    try:[m
+[32m+[m[32m        current_time = datetime.now()[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Создаем директорию если её нет[m
+[32m+[m[32m        data_dir = Path("electricity_data")[m
+[32m+[m[32m        data_dir.mkdir(exist_ok=True)[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Путь к файлу текущих данных[m
+[32m+[m[32m        current_file = data_dir / ELECTRICITY_DATA_FILE[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Загружаем существующие данные или создаем новые[m
+[32m+[m[32m        if current_file.exists():[m
+[32m+[m[32m            with open(current_file, 'r', encoding='utf-8') as f:[m
+[32m+[m[32m                data = json.load(f)[m
+[32m+[m[32m        else:[m
+[32m+[m[32m            data = {[m
+[32m+[m[32m                "last_update": current_time.isoformat(),[m
+[32m+[m[32m                "records": [],[m
+[32m+[m[32m                "total_records": 0[m
+[32m+[m[32m            }[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Создаем запись[m
+[32m+[m[32m        record = {[m
+[32m+[m[32m            "timestamp": current_time.isoformat(),[m
+[32m+[m[32m            "device_id": device_id,[m
+[32m+[m[32m            "device_name": device_name,[m
+[32m+[m[32m            "location": location,[m
+[32m+[m[32m            "power_w": power_w,[m
+[32m+[m[32m            "energy_kwh": energy_kwh,[m
+[32m+[m[32m            "is_on": is_on,[m
+[32m+[m[32m            "voltage": voltage,[m
+[32m+[m[32m            "current": current[m
+[32m+[m[32m        }[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Добавляем запись[m
+[32m+[m[32m        data["records"].append(record)[m
+[32m+[m[32m        data["last_update"] = current_time.isoformat()[m
+[32m+[m[32m        data["total_records"] = len(data["records"])[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Ограничиваем количество записей (храним последние 1000)[m
+[32m+[m[32m        max_records = 1000[m
+[32m+[m[32m        if len(data["records"]) > max_records:[m
+[32m+[m[32m            data["records"] = data["records"][-max_records:][m
+[32m+[m[32m            data["total_records"] = len(data["records"])[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Сохраняем в файл[m
+[32m+[m[32m        with open(current_file, 'w', encoding='utf-8') as f:[m
+[32m+[m[32m            json.dump(data, f, indent=2, ensure_ascii=False, default=str)[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Добавляем в исторические данные для синхронизации[m
+[32m+[m[32m        history_file = data_dir / ELECTRICITY_HISTORY_FILE[m
+[32m+[m[32m        if history_file.exists():[m
+[32m+[m[32m            with open(history_file, 'r', encoding='utf-8') as f:[m
+[32m+[m[32m                history = json.load(f)[m
+[32m+[m[32m        else:[m
+[32m+[m[32m            history = {[m
+[32m+[m[32m                "last_sync": current_time.isoformat(),[m
+[32m+[m[32m                "pending_records": [],[m
+[32m+[m[32m                "total_pending": 0[m
+[32m+[m[32m            }[m
+[32m+[m[41m        [m
+[32m+[m[32m        history["pending_records"].append(record)[m
+[32m+[m[32m        history["total_pending"] = len(history["pending_records"])[m
+[32m+[m[41m        [m
+[32m+[m[32m        with open(history_file, 'w', encoding='utf-8') as f:[m
+[32m+[m[32m            json.dump(history, f, indent=2, ensure_ascii=False, default=str)[m
+[32m+[m[41m        [m
+[32m+[m[32m        logger.debug(f"Данные электричества сохранены для {device_name}")[m
+[32m+[m[41m        [m
+[32m+[m[32m    except Exception as e:[m
+[32m+[m[32m        logger.error(f"Ошибка сохранения данных электричества: {e}")[m
+[32m+[m
+[32m+[m[32mdef sync_electricity_to_supabase():[m
+[32m+[m[32m    """Синхронизирует данные электричества с Supabase"""[m
+[32m+[m[32m    try:[m
+[32m+[m[32m        data_dir = Path("electricity_data")[m
+[32m+[m[32m        history_file = data_dir / ELECTRICITY_HISTORY_FILE[m
+[32m+[m[41m        [m
+[32m+[m[32m        if not history_file.exists():[m
+[32m+[m[32m            logger.info("Файл истории электричества не найден")[m
+[32m+[m[32m            return[m
+[32m+[m[41m        [m
+[32m+[m[32m        with open(history_file, 'r', encoding='utf-8') as f:[m
+[32m+[m[32m            history = json.load(f)[m
+[32m+[m[41m        [m
+[32m+[m[32m        pending_records = history.get("pending_records", [])[m
+[32m+[m[41m        [m
+[32m+[m[32m        if not pending_records:[m
+[32m+[m[32m            logger.info("Нет данных электричества для синхронизации")[m
+[32m+[m[32m            return[m
+[32m+[m[41m        [m
+[32m+[m[32m        logger.info(f"Синхронизация {len(pending_records)} записей электричества с Supabase...")[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Группируем записи по устройствам для создания сессий[m
+[32m+[m[32m        device_sessions = {}[m
+[32m+[m[41m        [m
+[32m+[m[32m        for record in pending_records:[m
+[32m+[m[32m            device_id = record["device_id"][m
+[32m+[m[32m            if device_id not in device_sessions:[m
+[32m+[m[32m                device_sessions[device_id] = [][m
+[32m+[m[32m            device_sessions[device_id].append(record)[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Создаем сессии для каждого устройства[m
+[32m+[m[32m        synced_count = 0[m
+[32m+[m[32m        for device_id, records in device_sessions.items():[m
+[32m+[m[32m            try:[m
+[32m+[m[32m                # Сортируем записи по времени[m
+[32m+[m[32m                sorted_records = sorted(records, key=lambda x: x["timestamp"])[m
+[32m+[m[41m                [m
+[32m+[m[32m                # Находим информацию об устройстве[m
+[32m+[m[32m                device_info = next((d for d in DEVICES if d["device_id"] == device_id), None)[m
+[32m+[m[32m                if not device_info:[m
+[32m+[m[32m                    logger.warning(f"Информация об устройстве {device_id} не найдена")[m
+[32m+[m[32m                    continue[m
+[32m+[m[41m     
